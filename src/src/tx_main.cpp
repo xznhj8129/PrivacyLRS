@@ -42,8 +42,10 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #if !defined(PLATFORM_ESP8266)
 #include <esp_system.h>  // esp_random() hardware TRNG
 #endif
-ChaCha cipher(20);  // ChaCha20 - RFC 8439 standard (Finding #5)
-uint8_t encryptionCounter[8];
+ChaCha cipherUplink(20);
+ChaCha cipherDownlink(20);
+uint8_t encryptionCounterUplink[8];
+uint8_t encryptionCounterDownlink[8];
 encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
 encryption_params_t nonce_key;
 #endif
@@ -281,28 +283,26 @@ bool InitCrypto()
 {
 
   encryption_params_t *enc_params;
-  uint8_t rounds = 20;  // ChaCha20 - RFC 8439 standard (Finding #5)
   size_t counterSize = 8;
   size_t keySize = 32;  // 256-bit keys (Finding #3)
 
   uint8_t counter[] = {109, 110, 111, 112, 113, 114, 115, 116};
+  ChaCha masterCipher(20);
 
-  memcpy(encryptionCounter, counter, counterSize);
-  cipher.clear();
-
+  // A recovery must not reuse the key/nonce material collected at boot.
+  CollectEntropy((uint8_t *)&nonce_key, sizeof(nonce_key));
   unsigned char *master_key = (unsigned char *) calloc( keySize + 1, sizeof(char) );
   hexStr2Arr( master_key, stringify_expanded(USE_ENCRYPTION), keySize );
 
-  cipher.setNumRounds(rounds);
-  if ( !cipher.setKey(master_key, keySize) )
+  if ( !masterCipher.setKey(master_key, keySize) )
   {
       return false;
   }
-  if ( !cipher.setIV(nonce_key.nonce, cipher.ivSize()) )
+  if ( !masterCipher.setIV(nonce_key.nonce, sizeof(nonce_key.nonce)) )
   {
       return false;
   }
-  if (!cipher.setCounter(counter, counterSize))
+  if (!masterCipher.setCounter(counter, counterSize))
   {
       return false;
   }
@@ -310,29 +310,15 @@ bool InitCrypto()
   // Encrypt the session key and send it
   MSPDataPackage[0] = MSP_ELRS_INIT_ENCRYPT;
   enc_params = (encryption_params_t *) &MSPDataPackage[1];
-  memcpy( enc_params->nonce, nonce_key.nonce, cipher.ivSize() );
+  memcpy( enc_params->nonce, nonce_key.nonce, sizeof(nonce_key.nonce) );
   memcpy( enc_params->key, nonce_key.key, keySize );
 
-  cipher.encrypt(enc_params->key, enc_params->key, keySize);
+  masterCipher.encrypt(enc_params->key, enc_params->key, keySize);
   free(master_key);
 
   DataUlSender.SetDataToTransmit(MSPDataPackage, sizeof(encryption_params_t) + 1);
 
-  // Further packets are encrypted with the session key
-  if ( !cipher.setKey(nonce_key.key, keySize) )
-  {
-      return false;
-  }
-  if ( !cipher.setIV(nonce_key.nonce, cipher.ivSize()) )
-  {
-      return false;
-  }
-  if (!cipher.setCounter(counter, counterSize))
-  {
-      return false;
-  }
-
-  return true;
+  return InitSessionCiphers(nonce_key.key, nonce_key.nonce);
 }
 #endif
 
@@ -401,19 +387,51 @@ static bool ICACHE_RAM_ATTR ProcessDownlinkPacket(SX12xxDriverCommon::rx_status 
     return false;
   }
 
-#ifdef USE_ENCRYPTION
-  if (encryptionStateSend == ENCRYPTION_STATE_FULL)
-  {
-    DecryptMsg( Radio.RXdataBuffer );
-  }
-#endif
-
   OTA_Packet_s * const otaPktPtr = (OTA_Packet_s * const)Radio.RXdataBuffer;
   OTA_Packet_s * const otaPktPtrSecond = (OTA_Packet_s * const)Radio.RXdataBufferSecond;
 
-  if (!OtaValidatePacketCrc(otaPktPtr))
+#ifdef USE_ENCRYPTION
+  bool packetValid;
+  if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+  {
+    packetValid = DecryptMsg(Radio.RXdataBuffer);
+    if (!packetValid)
+    {
+      // The RX sends plaintext LinkStats after it detects its own stream
+      // desynchronization. Its CRC is nonce-bound, so accept that explicit
+      // recovery signal and begin a fresh session.
+      packetValid = OtaValidatePacketCrc(otaPktPtr);
+      if (packetValid)
+      {
+        encryptionStateSend = ENCRYPTION_STATE_NONE;
+        DataUlSender.ResetState();
+        DataDlReceiver.ResetState();
+        syncSpamCounter = syncSpamAmount;
+      }
+    }
+  }
+  else
+  {
+    packetValid = OtaValidatePacketCrc(otaPktPtr);
+  }
+#else
+  bool packetValid = OtaValidatePacketCrc(otaPktPtr);
+#endif
+
+  if (!packetValid)
   {
     DBGLN("TLM crc error");
+#ifdef USE_ENCRYPTION
+    // This side can detect a downlink counter gap even when the RX has not
+    // noticed it yet. Recover immediately rather than waiting for timeout.
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+      encryptionStateSend = ENCRYPTION_STATE_NONE;
+      DataUlSender.ResetState();
+      DataDlReceiver.ResetState();
+      syncSpamCounter = syncSpamAmount;
+    }
+#endif
     return false;
   }
 
@@ -589,6 +607,13 @@ void ICACHE_RAM_ATTR GenerateSyncPacketData(OTA_Sync_s * const syncPtr)
   syncPtr->newTlmRatio = newTlmRatio - TLM_RATIO_NO_TLM;
   syncPtr->geminiMode = inGeminiMode();
   syncPtr->otaProtocol = config.GetLinkMode();
+#ifdef USE_ENCRYPTION
+  // A plaintext SYNC is the recovery beacon while a session is being established.
+  // It is never used for RC data.
+  syncPtr->cryptoResync = encryptionStateSend != ENCRYPTION_STATE_FULL;
+#else
+  syncPtr->cryptoResync = false;
+#endif
   syncPtr->UID4 = UID[4];
   syncPtr->UID5 = UID[5];
 
@@ -743,6 +768,17 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
   }
   else
   {
+#ifdef USE_ENCRYPTION
+    // Do not emit plaintext RC while a session is absent or being rekeyed.
+    // A SYNC lets the receiver reset its crypto state and learn any new rate.
+    if (encryptionStateSend != ENCRYPTION_STATE_FULL && !(NextPacketIsDataUl && DataUlSender.IsActive()))
+    {
+      otaPkt.std.type = PACKET_TYPE_SYNC;
+      GenerateSyncPacketData(OtaIsFullRes ? &otaPkt.full.sync.sync : &otaPkt.std.sync);
+      NextPacketIsDataUl = true;
+    }
+    else
+#endif
     if (firmwareOptions.is_airport)
     {
       OtaPackAirportData(&otaPkt, &apInputBuffer);
@@ -1118,6 +1154,14 @@ static void UpdateConnectDisconnectStatus()
     linkStats.uplink_Link_quality = 0;
     LinkStatsLastReported_Ms = 0; // Notify immediately
     connectionHasModelMatch = true;
+#ifdef USE_ENCRYPTION
+    // A missing downlink may have desynchronized one direction only. Start a
+    // fresh recovery beacon and key exchange instead of waiting for a manual reset.
+    encryptionStateSend = ENCRYPTION_STATE_NONE;
+    DataUlSender.ResetState();
+    DataDlReceiver.ResetState();
+    syncSpamCounter = syncSpamAmount;
+#endif
   }
 }
 
@@ -1131,6 +1175,13 @@ void SetSyncSpam()
   // Send sync spam if a UI device has requested to and the config has changed
   if (config.IsModified())
   {
+#ifdef USE_ENCRYPTION
+    // The old session is tied to the old link parameters. Rekey before the
+    // rate/configuration transition and discard stale reliable-transfer state.
+    encryptionStateSend = ENCRYPTION_STATE_NONE;
+    DataUlSender.ResetState();
+    DataDlReceiver.ResetState();
+#endif
     syncSpamCounter = syncSpamAmount;
     syncSpamCounterAfterRateChange = syncSpamAmountAfterRateChange;
   }
@@ -1601,7 +1652,7 @@ void setup()
     DBGLN("Initialised devices");
 
     setupBindingFromConfig();
-    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    InitFHSS();
 
     Radio.RXdoneCallback = &RXdoneISR;
     Radio.TXdoneCallback = &TXdoneISR;
@@ -1651,10 +1702,6 @@ void setup()
       // Set the pkt rate, TLM ratio, and power from the stored eeprom values
       ChangeRadioParams();
 
-#ifdef USE_ENCRYPTION
-      // Should be a good time to do this, because the radio is put into continuous recv mode here
-      CollectEntropy( (uint8_t *) &nonce_key, sizeof(nonce_key));
-#endif
       LbtCcaTimerStart();
       hwTimer::init(nullptr, timerCallback);
       setConnectionState(noCrossfire);

@@ -197,8 +197,8 @@ void test_encrypt_decrypt_synchronized(void) {
  * 4. RX tries to decrypt with counter N
  * 5. Result: Garbage data, CRC fails, packet dropped
  *
- * Expected: TEST FAILS (demonstrating vulnerability)
- * After fix: TEST PASSES (explicit counter allows resync)
+ * The raw shared-stream construction must desynchronize here. Production
+ * recovery detects that failure and establishes a new session.
  */
 void test_single_packet_loss_desync(void) {
     init_test_encryption();
@@ -227,9 +227,7 @@ void test_single_packet_loss_desync(void) {
     test_cipher_tx.encrypt(encrypted_2, plaintext_2, TEST_PACKET_SIZE);  // Counter = 2
     test_cipher_rx.encrypt(decrypted_2, encrypted_2, TEST_PACKET_SIZE);  // Counter = 1 (WRONG!)
 
-    // THIS WILL FAIL - decrypted_2 will NOT match plaintext_2
-    // Demonstrates the vulnerability: counters are out of sync
-    TEST_ASSERT_EQUAL_MEMORY(plaintext_2, decrypted_2, TEST_PACKET_SIZE);
+    TEST_ASSERT_FALSE(memcmp(plaintext_2, decrypted_2, TEST_PACKET_SIZE) == 0);
 }
 
 /**
@@ -244,8 +242,8 @@ void test_single_packet_loss_desync(void) {
  * - Link quality drops to 0%
  * - Failsafe triggered within 1.5-4 seconds
  *
- * Expected: TEST FAILS (demonstrating vulnerability)
- * After fix: TEST PASSES (explicit counter enables recovery)
+ * The raw shared-stream construction must desynchronize here. Production
+ * recovery detects that failure and establishes a new session.
  */
 void test_burst_packet_loss_exceeds_resync(void) {
     init_test_encryption();
@@ -282,9 +280,48 @@ void test_burst_packet_loss_exceeds_resync(void) {
     test_cipher_tx.encrypt(encrypted_final, plaintext_final, TEST_PACKET_SIZE);  // Counter = 41
     test_cipher_rx.encrypt(decrypted_final, encrypted_final, TEST_PACKET_SIZE);  // Counter = 1
 
-    // THIS WILL FAIL - gap is too large for resync
-    // Demonstrates permanent link failure scenario
-    TEST_ASSERT_EQUAL_MEMORY(plaintext_final, decrypted_final, TEST_PACKET_SIZE);
+    TEST_ASSERT_FALSE(memcmp(plaintext_final, decrypted_final, TEST_PACKET_SIZE) == 0);
+}
+
+void test_directional_streams_survive_lost_downlink_without_keystream_reuse(void) {
+    uint8_t key[TEST_KEY_SIZE_256];
+    uint8_t nonce[TEST_NONCE_SIZE];
+    uint8_t counter[TEST_COUNTER_SIZE] = {109, 110, 111, 112, 113, 114, 115, 116};
+    uint8_t uplinkNonce[TEST_NONCE_SIZE];
+    uint8_t downlinkNonce[TEST_NONCE_SIZE];
+    uint8_t plaintext[TEST_PACKET_SIZE] = {};
+    uint8_t encryptedUplink[TEST_PACKET_SIZE];
+    uint8_t encryptedDownlink[TEST_PACKET_SIZE];
+    uint8_t decrypted[TEST_PACKET_SIZE];
+    ChaCha txUplink(20);
+    ChaCha rxUplink(20);
+    ChaCha rxDownlink(20);
+
+    for (uint8_t i = 0; i < TEST_KEY_SIZE_256; i++) key[i] = i;
+    for (uint8_t i = 0; i < TEST_NONCE_SIZE; i++) nonce[i] = i + 32;
+    memcpy(uplinkNonce, nonce, sizeof(uplinkNonce));
+    memcpy(downlinkNonce, nonce, sizeof(downlinkNonce));
+    uplinkNonce[TEST_NONCE_SIZE - 1] ^= 0x55;
+    downlinkNonce[TEST_NONCE_SIZE - 1] ^= 0xAA;
+
+    TEST_ASSERT_TRUE(txUplink.setKey(key, sizeof(key)));
+    TEST_ASSERT_TRUE(txUplink.setIV(uplinkNonce, sizeof(uplinkNonce)));
+    TEST_ASSERT_TRUE(txUplink.setCounter(counter, sizeof(counter)));
+    TEST_ASSERT_TRUE(rxUplink.setKey(key, sizeof(key)));
+    TEST_ASSERT_TRUE(rxUplink.setIV(uplinkNonce, sizeof(uplinkNonce)));
+    TEST_ASSERT_TRUE(rxUplink.setCounter(counter, sizeof(counter)));
+    TEST_ASSERT_TRUE(rxDownlink.setKey(key, sizeof(key)));
+    TEST_ASSERT_TRUE(rxDownlink.setIV(downlinkNonce, sizeof(downlinkNonce)));
+    TEST_ASSERT_TRUE(rxDownlink.setCounter(counter, sizeof(counter)));
+
+    txUplink.encrypt(encryptedUplink, plaintext, sizeof(plaintext));
+    rxUplink.decrypt(decrypted, encryptedUplink, sizeof(encryptedUplink));
+    TEST_ASSERT_EQUAL_MEMORY(plaintext, decrypted, sizeof(plaintext));
+
+    // This packet is lost. With the former shared stream, it could have used
+    // the same key/nonce/counter position as a later uplink packet.
+    rxDownlink.encrypt(encryptedDownlink, plaintext, sizeof(plaintext));
+    TEST_ASSERT_FALSE(memcmp(encryptedUplink, encryptedDownlink, sizeof(plaintext)) == 0);
 }
 
 /**
@@ -1493,6 +1530,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_encrypt_decrypt_synchronized);
     RUN_TEST(test_single_packet_loss_desync);
     RUN_TEST(test_burst_packet_loss_exceeds_resync);
+    RUN_TEST(test_directional_streams_survive_lost_downlink_without_keystream_reuse);
     RUN_TEST(test_counter_never_reused);
 
     // Hardcoded Counter Tests (HIGH - Finding #2) - REMOVED 2025-12-01

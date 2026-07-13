@@ -53,6 +53,7 @@ extern const fhss_config_t *FHSSconfigDualBand;
 // create and randomise an FHSS sequence
 void FHSSrandomiseFHSSsequence(uint32_t seed);
 void FHSSrandomiseFHSSsequenceBuild(uint32_t seed, uint32_t freqCount, uint_fast8_t sync_channel, uint8_t *sequence);
+void FHSSrandomiseFHSSsequenceSecure(uint8_t const key[32]);
 
 static inline uint32_t FHSSgetMinimumFreq(void)
 {

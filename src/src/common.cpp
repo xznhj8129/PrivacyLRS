@@ -1,5 +1,6 @@
 #include "common.h"
 #include "OTA.h"
+#include "FHSS.h"
 
 #ifdef USE_ENCRYPTION
 #include <encryption.h>
@@ -12,6 +13,17 @@
 #include <avr/pgmspace.h>
 #endif
 #endif
+
+void InitFHSS()
+{
+#ifdef USE_ENCRYPTION
+    uint8_t masterKey[32];
+    hexStr2Arr(masterKey, stringify_expanded(USE_ENCRYPTION), sizeof(masterKey));
+    FHSSrandomiseFHSSsequenceSecure(masterKey);
+#else
+    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+#endif
+}
 
 #if defined(RADIO_SX127X)
 
@@ -238,8 +250,26 @@ bool ICACHE_RAM_ATTR isDualRadio()
 }
 
 #ifdef USE_ENCRYPTION
-extern ChaCha cipher;
-extern uint8_t encryptionCounter[8];
+extern ChaCha cipherUplink;
+extern ChaCha cipherDownlink;
+extern uint8_t encryptionCounterUplink[8];
+extern uint8_t encryptionCounterDownlink[8];
+
+#if defined(TARGET_TX)
+#define ENCRYPT_CIPHER cipherUplink
+#define ENCRYPT_COUNTER encryptionCounterUplink
+#define DECRYPT_CIPHER cipherDownlink
+#define DECRYPT_COUNTER encryptionCounterDownlink
+#else
+#define ENCRYPT_CIPHER cipherDownlink
+#define ENCRYPT_COUNTER encryptionCounterDownlink
+#define DECRYPT_CIPHER cipherUplink
+#define DECRYPT_COUNTER encryptionCounterUplink
+#endif
+
+static const uint8_t EncryptionInitialCounter[] = {109, 110, 111, 112, 113, 114, 115, 116};
+static const uint8_t EncryptionUplinkNonceDomain = 0x55;
+static const uint8_t EncryptionDownlinkNonceDomain = 0xAA;
 
 // Helper function to increment 64-bit counter (little-endian)
 static void incrementCounter(uint8_t *counter)
@@ -266,11 +296,11 @@ void ICACHE_RAM_ATTR EncryptMsg(uint8_t *output, uint8_t *input)
   }
 
   // Encrypt with current counter
-  cipher.encrypt(output, input, packetSize);
+  ENCRYPT_CIPHER.encrypt(output, input, packetSize);
 
   // Explicitly increment counter for next packet
-  incrementCounter(encryptionCounter);
-  cipher.setCounter(encryptionCounter, 8);
+  incrementCounter(ENCRYPT_COUNTER);
+  ENCRYPT_CIPHER.setCounter(ENCRYPT_COUNTER, 8);
 }
 
 bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
@@ -278,7 +308,6 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
   uint8_t decrypted[OTA8_PACKET_SIZE];
   size_t packetSize;
   bool success = false;
-  static bool encryptionStarted = false;
   OTA_Packet_s *otaPktPtr;
   uint8_t oldCrcHigh;
   uint8_t tryCounter[8];
@@ -292,33 +321,21 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
       packetSize = OTA4_PACKET_SIZE;
   }
 
-  // Try current expected counter and small lookahead window
-  // Lookahead handles: packet loss, timing jitter, RX starting mid-stream
-  int8_t offsets[] = {0, 1, 2, 3, -1};
+  // Each RF direction has an independent stream, so a lost downlink cannot
+  // reuse an uplink keystream. Look ahead only for lost packets in this
+  // direction; accepting an older counter would re-accept a replay.
+  uint8_t offsets[] = {0, 1, 2, 3};
 
-  for (int i = 0; i < 5 && !success; i++)
+  for (int i = 0; i < 4 && !success; i++)
   {
     // Calculate trial counter = expected + offset
-    memcpy(tryCounter, encryptionCounter, 8);
+    memcpy(tryCounter, DECRYPT_COUNTER, 8);
     for (int j = 0; j < offsets[i]; j++)
       incrementCounter(tryCounter);
 
-    // Handle negative offset
-    if (offsets[i] == -1)
-    {
-      memcpy(tryCounter, encryptionCounter, 8);
-      // Decrement by subtracting 1 (borrow propagation)
-      for (int k = 0; k < 8; k++)
-      {
-        tryCounter[k]--;
-        if (tryCounter[k] != 0xFF)
-          break;  // No borrow needed
-      }
-    }
-
     // Set cipher to trial counter and decrypt
-    cipher.setCounter(tryCounter, 8);
-    cipher.encrypt(decrypted, input, packetSize);
+    DECRYPT_CIPHER.setCounter(tryCounter, 8);
+    DECRYPT_CIPHER.encrypt(decrypted, input, packetSize);
 
     // Validate CRC
     otaPktPtr = (OTA_Packet_s *) decrypted;
@@ -337,26 +354,45 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
     if (success)
     {
       // Found correct counter - update expected for next packet
-      memcpy(encryptionCounter, tryCounter, 8);
-      incrementCounter(encryptionCounter);
+      memcpy(DECRYPT_COUNTER, tryCounter, 8);
+      incrementCounter(DECRYPT_COUNTER);
       break;
     }
   }
 
-  encryptionStarted = encryptionStarted || success;
-
   if (success)
   {
     memcpy(input, decrypted, packetSize);
-    cipher.setCounter(encryptionCounter, 8);
+    DECRYPT_CIPHER.setCounter(DECRYPT_COUNTER, 8);
   }
   else
   {
     // Failed to decrypt - keep current expected counter
-    cipher.setCounter(encryptionCounter, 8);
+    DECRYPT_CIPHER.setCounter(DECRYPT_COUNTER, 8);
   }
 
   return(success);
+}
+
+static bool InitSessionCipher(ChaCha &cipher, uint8_t const *key, uint8_t const *nonce, uint8_t nonceDomain)
+{
+  uint8_t directionalNonce[8];
+  memcpy(directionalNonce, nonce, sizeof(directionalNonce));
+  directionalNonce[sizeof(directionalNonce) - 1] ^= nonceDomain;
+
+  cipher.clear();
+  cipher.setNumRounds(20);
+  if (!cipher.setKey(key, 32)) return false;
+  if (!cipher.setIV(directionalNonce, sizeof(directionalNonce))) return false;
+  return cipher.setCounter(EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
+}
+
+bool InitSessionCiphers(uint8_t const *key, uint8_t const *nonce)
+{
+  memcpy(encryptionCounterUplink, EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
+  memcpy(encryptionCounterDownlink, EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
+  if (!InitSessionCipher(cipherUplink, key, nonce, EncryptionUplinkNonceDomain)) return false;
+  return InitSessionCipher(cipherDownlink, key, nonce, EncryptionDownlinkNonceDomain);
 }
 
 /// in: valid chars are 0-9 + A-F + a-f

@@ -48,6 +48,7 @@ typedef struct encryption_params_s
 
 bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input);
 void ICACHE_RAM_ATTR EncryptMsg(uint8_t *input, uint8_t *output);
+bool InitSessionCiphers(uint8_t const *key, uint8_t const *nonce);
 
 /// in: valid chars are 0-9 + A-F + a-f
 /// out_len_max==0: convert until the end of input string, out_len_max>0 only convert this many numbers

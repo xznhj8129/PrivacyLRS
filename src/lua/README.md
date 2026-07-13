@@ -9,5 +9,5 @@ When copying the lua to you handset, delete any old versions such as ELRS.lua, e
 Click the file link above, find the "Raw" button near the top of that page. Right-click, Save link as.., copy the .lua file into the /SCRIPTS/TOOLS directory of the SD card on your handset.
 
 ### Downloading from Configurator:
-Use the button shown in the image below to download the .lua script into the /SCRIPTS/TOOLS directory of the SD card on your handset.
+Use the button shown in the image below to download the .lua script into the /SCRIPTS/TOOLS directory of the SD card on your handset when building from a GitHub source. The Configurator cannot download the Lua script from a Local source; copy `elrs.lua` from this directory to `/SCRIPTS/TOOLS` yourself.
 ![downloadlua](https://user-images.githubusercontent.com/68074253/129203116-c1234719-3e8c-4cbf-a391-b7fb8dc0262d.png)

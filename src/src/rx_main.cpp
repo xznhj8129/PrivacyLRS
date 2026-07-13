@@ -62,9 +62,11 @@
 #else
 #include <avr/pgmspace.h>
 #endif
-ChaCha cipher(20);  // ChaCha20 - RFC 8439 standard (Finding #5)
+ChaCha cipherUplink(20);
+ChaCha cipherDownlink(20);
 encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
-uint8_t encryptionCounter[8];
+uint8_t encryptionCounterUplink[8];
+uint8_t encryptionCounterDownlink[8];
 #endif
 //
 // Code encapsulated by the ARDUINO_CORE_INVERT_FIX #ifdef temporarily fixes EpressLRS issue #2609 which is caused
@@ -447,11 +449,11 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 
 bool CryptoSetKeys(encryption_params_t *params)
 {
-    uint8_t rounds = 20;  // ChaCha20 - RFC 8439 standard (Finding #5)
     size_t counterSize = 8;
     size_t keySize = 32;  // 256-bit keys (Finding #3)
 
     uint8_t counter[]     = {109, 110, 111, 112, 113, 114, 115, 116};
+    ChaCha masterCipher(20);
 
 
     // Decrypt the session key, which is encrypted with the master key
@@ -460,44 +462,26 @@ bool CryptoSetKeys(encryption_params_t *params)
     DBGLN_KEY("encrypted session key = %d, %d, %d, %d", params->key[0], params->key[1], params->key[2], params->key[3]);
     DBGLN_KEY("master_key = %d, %d, %d, %d", master_key[0], master_key[1], master_key[2], master_key[3]);
 
-    cipher.clear();
-    if ( !cipher.setKey(master_key, keySize) )
+    if ( !masterCipher.setKey(master_key, keySize) )
     {
         return false;
     }
-    if ( !cipher.setIV(params->nonce, cipher.ivSize()) )
+    if ( !masterCipher.setIV(params->nonce, sizeof(params->nonce)) )
     {
         return false;
     }
-    if (!cipher.setCounter(counter, counterSize))
+    if (!masterCipher.setCounter(counter, counterSize))
     {
         return false;
     }
-    cipher.setNumRounds(rounds);
-    cipher.decrypt(params->key, params->key, keySize);
+    masterCipher.decrypt(params->key, params->key, keySize);
     free(master_key);
 
 
     DBGLN_KEY("New key = dec: %d, %d, %d hex:  %x, %x, %x", params->key[0], params->key[1], params->key[2], params->key[3],
     params->key[4], params->key[5], params->key[6]);
 
-    // Further packets are encrypted with the session key
-    memcpy(encryptionCounter, counter, counterSize);
-    cipher.clear();
-    if ( !cipher.setKey(params->key, keySize) )
-    {
-        return false;
-    }
-    if ( !cipher.setIV(params->nonce, cipher.ivSize()) )
-    {
-        return false;
-    }
-    if (!cipher.setCounter(counter, counterSize))
-    {
-        return false;
-    }
-    cipher.setNumRounds(rounds);
-    return true;
+    return InitSessionCiphers(params->key, params->nonce);
 }
 
 #endif
@@ -548,6 +532,15 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     {
         tlmQueued = DataDlSender.IsActive();
     }
+
+#ifdef USE_ENCRYPTION
+    // LinkStats carries the stubborn acknowledgement needed for the key
+    // proposal. Hold all application telemetry until the new session is live.
+    if (encryptionStateSend != ENCRYPTION_STATE_FULL)
+    {
+        tlmQueued = false;
+    }
+#endif
 
     if (NextTelemetryType == PACKET_TYPE_LINKSTATS || !tlmQueued)
     {
@@ -636,6 +629,16 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     {
         Radio.TXnb((uint8_t*)&otaPktGemini, sendGeminiBuffer, (uint8_t*)&otaPkt, transmittingRadio);
     }
+
+#ifdef USE_ENCRYPTION
+    // The session-key proposal is acknowledged by this first downlink packet.
+    // Keep that acknowledgement plaintext so the TX can confirm the proposal
+    // and begin decrypting on the following packet.
+    if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED && transmittingRadio != SX12XX_Radio_NONE)
+    {
+        encryptionStateSend = ENCRYPTION_STATE_FULL;
+    }
+#endif
 
     if (transmittingRadio == SX12XX_Radio_NONE)
     {
@@ -1182,7 +1185,30 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
 #ifdef USE_ENCRYPTION
     if (encryptionStateSend == ENCRYPTION_STATE_FULL)
     {
-	    DecryptMsg( Radio.RXdataBuffer );
+        // A recovery SYNC is deliberately plaintext and CRC-checked with the
+        // binding-derived OTA initializer. Validate a copy because OTA4 CRC
+        // validation clears crcHigh in place.
+        OTA_Packet_s plaintextPacket = *(OTA_Packet_s *)Radio.RXdataBuffer;
+        OTA_Sync_s const * const plaintextSync = OtaIsFullRes ? &plaintextPacket.full.sync.sync : &plaintextPacket.std.sync;
+        if (plaintextPacket.std.type == PACKET_TYPE_SYNC
+            && plaintextSync->cryptoResync
+            && plaintextSync->UID4 == UID[4]
+            && (plaintextSync->UID5 & ~MODELMATCH_MASK) == (UID[5] & ~MODELMATCH_MASK)
+            && OtaValidatePacketCrc(&plaintextPacket))
+        {
+            encryptionStateSend = ENCRYPTION_STATE_NONE;
+            DataUlReceiver.ResetState();
+            DataDlSender.ResetState();
+        }
+        else if (!DecryptMsg(Radio.RXdataBuffer))
+        {
+            // The TX will recognize the following plaintext LinkStats as a
+            // nonce-bound recovery signal and initiate a fresh key exchange.
+            encryptionStateSend = ENCRYPTION_STATE_NONE;
+            DataUlReceiver.ResetState();
+            DataDlSender.ResetState();
+            return false;
+        }
     }
 #endif
 
@@ -1337,7 +1363,7 @@ void DataUlReceiveComplete()
 
 	    encryption_params = (encryption_params_t *) &DataUlBuffer[1];
 		CryptoSetKeys(encryption_params);
-		encryptionStateSend = ENCRYPTION_STATE_FULL;
+		encryptionStateSend = ENCRYPTION_STATE_PROPOSED;
 		break;
 #endif
 
@@ -1801,7 +1827,7 @@ static void ExitBindingMode()
     config.Commit();
 
     OtaUpdateCrcInitFromUid();
-    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    InitFHSS();
 
     webserverPreventAutoStart = true;
 
@@ -2136,7 +2162,7 @@ void setup()
 
         setupBindingFromConfig();
 
-        FHSSrandomiseFHSSsequence(uidMacSeedGet());
+        InitFHSS();
 
         setupRadio();
 

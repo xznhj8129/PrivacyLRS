@@ -36,7 +36,7 @@ typedef struct {
             newTlmRatio:3,
             geminiMode:1,
             otaProtocol:2,
-            free:1;
+            cryptoResync:1;
     uint8_t UID4;
     uint8_t UID5;
 } PACKED OTA_Sync_s;

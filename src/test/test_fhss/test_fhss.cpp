@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstring>
 #include <SX1280_Regs.h>
 #include <FHSS.h>
 #include <unity.h>
@@ -84,6 +85,29 @@ void test_fhss_reg_same(void)
     }
 }
 
+void test_secure_fhss_is_deterministic_and_keyed(void)
+{
+    const uint8_t keyA[32] = {0};
+    uint8_t keyB[32] = {0};
+    uint8_t first[FHSS_SEQUENCE_LEN];
+
+    keyB[0] = 1;
+    FHSSrandomiseFHSSsequenceSecure(keyA);
+    memcpy(first, FHSSsequence, FHSSgetSequenceCount());
+
+    FHSSrandomiseFHSSsequenceSecure(keyA);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(first, FHSSsequence, FHSSgetSequenceCount());
+
+    FHSSrandomiseFHSSsequenceSecure(keyB);
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(first, FHSSsequence, FHSSgetSequenceCount()));
+
+    const uint32_t numFhss = FHSSgetChannelCount();
+    for (unsigned int i = 0; i < FHSSgetSequenceCount(); i += numFhss)
+    {
+        TEST_ASSERT_EQUAL(sync_channel, FHSSsequence[i]);
+    }
+}
+
 // Unity setup/teardown
 void setUp() {}
 void tearDown() {}
@@ -96,6 +120,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_fhss_unique);
     RUN_TEST(test_fhss_same);
     RUN_TEST(test_fhss_reg_same);
+    RUN_TEST(test_secure_fhss_is_deterministic_and_keyed);
     UNITY_END();
 
     return 0;

@@ -1,6 +1,7 @@
 #include "FHSS.h"
 #include "logging.h"
 #include "options.h"
+#include <ChaCha.h>
 #include <string.h>
 
 #if defined(RADIO_SX127X) || defined(RADIO_LR1121)
@@ -103,6 +104,79 @@ void FHSSrandomiseFHSSsequence(const uint32_t seed)
     FHSSrandomiseFHSSsequenceBuild(seed, FHSSconfigDualBand->freq_count, sync_channel_DualBand, FHSSsequence_DualBand);
     FHSSusePrimaryFreqBand = true;
 #endif
+}
+
+static uint8_t SecureRandomInRange(ChaCha &cipher, uint8_t range)
+{
+    uint8_t zero = 0;
+    uint8_t random;
+    uint16_t threshold = 256 - (256 % range);
+
+    do
+    {
+        cipher.encrypt(&random, &zero, sizeof(random));
+    } while (random >= threshold);
+
+    return random % range;
+}
+
+static void FHSSrandomiseFHSSsequenceSecureBuild(ChaCha &cipher, uint16_t sequenceCount,
+                                                   uint32_t freqCount, uint_fast8_t syncChannel,
+                                                   uint8_t *inSequence)
+{
+    for (uint16_t i = 0; i < sequenceCount; i++)
+    {
+        if (i % freqCount == 0)
+        {
+            inSequence[i] = syncChannel;
+        }
+        else if (i % freqCount == syncChannel)
+        {
+            inSequence[i] = 0;
+        }
+        else
+        {
+            inSequence[i] = i % freqCount;
+        }
+    }
+
+    for (uint16_t block = 0; block < sequenceCount / freqCount; block++)
+    {
+        uint16_t offset = block * freqCount;
+        for (uint8_t i = freqCount - 1; i >= 2; i--)
+        {
+            uint8_t swapIndex = SecureRandomInRange(cipher, i) + 1;
+            uint8_t temp = inSequence[offset + i];
+            inSequence[offset + i] = inSequence[offset + swapIndex];
+            inSequence[offset + swapIndex] = temp;
+        }
+    }
+}
+
+void FHSSrandomiseFHSSsequenceSecure(uint8_t const key[32])
+{
+    static const uint8_t counter[8] = {};
+    uint8_t nonce[8] = {'P', 'L', 'R', 'S', 'H', 'O', 'P', 1};
+    ChaCha cipher(20);
+
+    FHSSrandomiseFHSSsequence(0);
+
+    cipher.setKey(key, 32);
+    cipher.setIV(nonce, sizeof(nonce));
+    cipher.setCounter(counter, sizeof(counter));
+    FHSSrandomiseFHSSsequenceSecureBuild(cipher, primaryBandCount, FHSSconfig->freq_count,
+                                          sync_channel, FHSSsequence);
+
+#if defined(RADIO_LR1121)
+    nonce[sizeof(nonce) - 1] = 2;
+    cipher.setKey(key, 32);
+    cipher.setIV(nonce, sizeof(nonce));
+    cipher.setCounter(counter, sizeof(counter));
+    FHSSrandomiseFHSSsequenceSecureBuild(cipher, secondaryBandCount, FHSSconfigDualBand->freq_count,
+                                          sync_channel_DualBand, FHSSsequence_DualBand);
+#endif
+
+    FHSSptr = 0;
 }
 
 /**
