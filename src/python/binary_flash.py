@@ -13,7 +13,9 @@ from firmware import DeviceType, FirmwareOptions, MCUType
 
 import sys
 from os.path import dirname
-sys.path.append(dirname(__file__) + '/external/esptool')
+# insert (not append) so the vendored esptool shadows any system-installed
+# esptool — mixing the two versions crashes mid-flash
+sys.path.insert(0, dirname(__file__) + '/external/esptool')
 
 from external.esptool import esptool
 sys.path.append(dirname(__file__) + "/external")
