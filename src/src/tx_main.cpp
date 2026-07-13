@@ -263,7 +263,7 @@ bool InitCrypto()
 {
 
   encryption_params_t *enc_params;
-  uint8_t rounds = 12;
+  uint8_t rounds = 20;  // ChaCha20 - RFC 8439 standard (Finding #5)
   size_t counterSize = 8;
   size_t keySize = 16;
 

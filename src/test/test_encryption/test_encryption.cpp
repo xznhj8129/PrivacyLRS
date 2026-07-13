@@ -121,8 +121,8 @@ bool DecryptMsg(uint8_t *input) {
 // ============================================================================
 
 // Global test state for counter synchronization tests
-static ChaCha test_cipher_tx(12);
-static ChaCha test_cipher_rx(12);
+static ChaCha test_cipher_tx(20);
+static ChaCha test_cipher_rx(20);
 static uint8_t test_key[TEST_KEY_SIZE_128];
 static uint8_t test_nonce[TEST_NONCE_SIZE];
 static uint8_t test_counter[TEST_COUNTER_SIZE];
@@ -152,14 +152,14 @@ void init_test_encryption(void) {
     test_cipher_tx.setKey(test_key, TEST_KEY_SIZE_128);
     test_cipher_tx.setIV(test_nonce, TEST_NONCE_SIZE);
     test_cipher_tx.setCounter(test_counter, TEST_COUNTER_SIZE);
-    test_cipher_tx.setNumRounds(12);
+    test_cipher_tx.setNumRounds(20);
 
     // Initialize RX cipher (identical to TX initially)
     test_cipher_rx.clear();
     test_cipher_rx.setKey(test_key, TEST_KEY_SIZE_128);
     test_cipher_rx.setIV(test_nonce, TEST_NONCE_SIZE);
     test_cipher_rx.setCounter(test_counter, TEST_COUNTER_SIZE);
-    test_cipher_rx.setNumRounds(12);
+    test_cipher_rx.setNumRounds(20);
 }
 
 /**
@@ -933,9 +933,8 @@ void test_chacha_round_configuration(void) {
     // This demonstrates that round configuration matters
     TEST_ASSERT_FALSE(memcmp(ciphertext12, ciphertext20, 32) == 0);
 
-    // Note: Current PrivacyLRS uses 12 rounds (see tx_main.cpp:36, rx_main.cpp:506)
-    // RFC 8439 specifies 20 rounds for ChaCha20
-    // Recommendation: Use 20 rounds for security margin
+    // Note: PrivacyLRS uses 20 rounds (RFC 8439 ChaCha20) in
+    // tx_main.cpp:InitCrypto() and rx_main.cpp:CryptoSetKeys()
 }
 
 /**
@@ -1051,7 +1050,7 @@ void init_integration_test(void) {
     cipher.setKey(key, 16);
     cipher.setIV(nonce, 8);
     cipher.setCounter(counter, 8);
-    cipher.setNumRounds(12);
+    cipher.setNumRounds(20);
 
     memcpy(encryptionCounter, counter, 8);
 
