@@ -65,3 +65,47 @@ To configure your ExpressLRS / PrivacyLRS hardware, the ExpressLRS Configurator 
 
 https://github.com/ExpressLRS/ExpressLRS-Configurator/releases/
 
+
+## Changelog — ExpressLRS 4.0.1 port (branch `secure_4.0.1`, 2026-07-13)
+
+This branch rebases PrivacyLRS from its previous ExpressLRS 3.5.3 base onto upstream
+**ExpressLRS 4.0.1**, and hardens the encryption while at it. It is a clean-slate release:
+**not over-the-air compatible with any previous PrivacyLRS build** — reflash both TX and RX.
+
+### Port to ExpressLRS 4.0.1
+- Merged upstream tag `4.0.1` (527 files changed upstream, including removal of STM32 support
+  and a redesigned telemetry/uplink data path).
+- Adapted the encryption hooks to renamed 4.0.1 internals: `MspSender`→`DataUlSender`,
+  `MspData`→`DataUlBuffer`, `HandleSendTelemetryResponse`→`HandleSendDataDl`,
+  `ProcessTLMpacket`→`ProcessDownlinkPacket`, `ELRS_MSP_BUFFER`→`ELRS_DATA_UL_BUFFER`.
+- New in 4.0.1 and now covered by encryption: Gemini/dual-band dual-packet transmit
+  (both packets encrypted) and the second-radio receive buffer used by true-diversity and
+  dual-band receivers (decrypted before CRC validation on both TX and RX sides).
+- Verified on the Radiomaster XR1 Dual Band RX target (`Unified_ESP32C3_LR1121_RX`) plus
+  ESP32 LR1121/2400/900 TX targets.
+
+### Security fixes and hardening
+- **ChaCha20 for real (Finding #5):** the previous "ChaCha20 upgrade" set the constructor to
+  20 rounds but `InitCrypto()`/`CryptoSetKeys()` still called `setNumRounds(12)`, silently
+  downgrading the link to ChaCha12 at runtime. Now genuinely RFC 8439 ChaCha20.
+- **256-bit keys (Finding #3):** the master key now uses the full SHA-256 of the binding
+  phrase (previously truncated to 128 bits) and session keys are 256-bit.
+- **Hardware TRNG entropy (Finding #8):** session key/nonce entropy now mixes the SoC
+  hardware random number generator (`esp_random()`; `RANDOM_REG32` on ESP8266) with the
+  existing radio RSSI noise, so neither source alone must be perfect.
+
+### Bugs found and fixed during the port
+- `DecryptMsg()` validated full-resolution packets through an **uninitialized pointer**
+  (only the OTA4 branch set it) — would have crashed LR1121 full-res rates with encryption on.
+- `RandRSSI()` on SX1280/LR1121 used the old `Radio.RXnb(mode)` signature, which no longer
+  exists in 4.0.1 — broke all TX builds (RX-only builds never compile that path).
+
+### Other deltas
+- Removed dead code: unused `GetRandomBytes()`/`GetRandom32t()`, the unused
+  `ELRS_TELEMETRY_TYPE_ENCRYPTION` define, and STM32-era `ICACHE_RAM_ATTR1/2` shims.
+- Known/expected: 2 of 24 native encryption tests (`test_single_packet_loss_desync`,
+  `test_burst_packet_loss_exceeds_resync`) fail by design — they demonstrate the raw
+  stream-cipher desync vulnerability without the resync logic; the integration tests that
+  exercise the actual recovery path all pass. The native suite silently skips (reported as
+  SIGHUP/ERRORED) unless a `MY_BINDING_PHRASE` is set, e.g. in `src/super_defines.txt`.
+- Still open, deliberately deferred: forward secrecy via Curve25519 ECDH (Finding #7).
