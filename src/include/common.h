@@ -17,6 +17,10 @@
 #include <cstdint>
 #endif // UNIT_TEST
 
+#ifdef USE_ENCRYPTION
+#include "encryption.h"
+#endif
+
 #define UID_LEN             6
 
 typedef enum : uint8_t

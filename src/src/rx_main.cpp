@@ -50,6 +50,22 @@
 #include "esp_task_wdt.h"
 #endif
 
+
+#ifdef USE_ENCRYPTION
+#include <encryption.h>
+#include <Crypto.h>
+#include <ChaCha.h>
+#include <string.h>
+
+#if defined(ESP8266) || defined(ESP32)
+#include <pgmspace.h>
+#else
+#include <avr/pgmspace.h>
+#endif
+ChaCha cipher(20);  // ChaCha20 - RFC 8439 standard (Finding #5)
+encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
+uint8_t encryptionCounter[8];
+#endif
 //
 // Code encapsulated by the ARDUINO_CORE_INVERT_FIX #ifdef temporarily fixes EpressLRS issue #2609 which is caused
 // by the Arduino core (see https://github.com/espressif/arduino-esp32/issues/9896) and fixed
@@ -427,6 +443,65 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 #endif
 }
 
+#ifdef USE_ENCRYPTION
+
+bool CryptoSetKeys(encryption_params_t *params)
+{
+    uint8_t rounds = 12;
+    size_t counterSize = 8;
+    size_t keySize = 16;
+
+    uint8_t counter[]     = {109, 110, 111, 112, 113, 114, 115, 116};
+
+
+    // Decrypt the session key, which is encrypted with the master key
+    unsigned char *master_key = (unsigned char *) calloc( keySize + 1, sizeof(char) );
+    hexStr2Arr( master_key, stringify_expanded(USE_ENCRYPTION), keySize );
+    DBGLN_KEY("encrypted session key = %d, %d, %d, %d", params->key[0], params->key[1], params->key[2], params->key[3]);
+    DBGLN_KEY("master_key = %d, %d, %d, %d", master_key[0], master_key[1], master_key[2], master_key[3]);
+
+    cipher.clear();
+    if ( !cipher.setKey(master_key, keySize) )
+    {
+        return false;
+    }
+    if ( !cipher.setIV(params->nonce, cipher.ivSize()) )
+    {
+        return false;
+    }
+    if (!cipher.setCounter(counter, counterSize))
+    {
+        return false;
+    }
+    cipher.setNumRounds(rounds);
+    cipher.decrypt(params->key, params->key, keySize);
+    free(master_key);
+
+
+    DBGLN_KEY("New key = dec: %d, %d, %d hex:  %x, %x, %x", params->key[0], params->key[1], params->key[2], params->key[3],
+    params->key[4], params->key[5], params->key[6]);
+
+    // Further packets are encrypted with the session key
+    memcpy(encryptionCounter, counter, counterSize);
+    cipher.clear();
+    if ( !cipher.setKey(params->key, keySize) )
+    {
+        return false;
+    }
+    if ( !cipher.setIV(params->nonce, cipher.ivSize()) )
+    {
+        return false;
+    }
+    if (!cipher.setCounter(counter, counterSize))
+    {
+        return false;
+    }
+    cipher.setNumRounds(rounds);
+    return true;
+}
+
+#endif
+
 #define GenerateOtaDataDl(ota, member, ls)  {\
    const size_t dataLen = sizeof(otaPkt.ota.member.payload); \
    otaPkt.ota.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm(); \
@@ -538,6 +613,17 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
             transmittingRadio = Radio.GetStrongestReceivingRadio(); // Pick the radio with best rf connection to the tx.
         }
     }
+
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+      EncryptMsg( (uint8_t*)&otaPkt, (uint8_t*)&otaPkt );
+      if (sendGeminiBuffer)
+      {
+        EncryptMsg( (uint8_t*)&otaPktGemini, (uint8_t*)&otaPktGemini );
+      }
+    }
+#endif
 
     // Gemini flips frequencies between radios on the rx side only.  This is to help minimise antenna cross polarization.
     // The payloads need to be switch when this happens.
@@ -1093,6 +1179,13 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     }
     uint32_t const beginProcessing = micros();
 
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+	    DecryptMsg( Radio.RXdataBuffer );
+    }
+#endif
+
     OTA_Packet_s * const otaPktPtr = (OTA_Packet_s * const)Radio.RXdataBuffer;
     OTA_Packet_s * const otaPktPtrSecond = (OTA_Packet_s * const)Radio.RXdataBufferSecond;
 
@@ -1120,6 +1213,12 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     Radio.CheckForSecondPacket();
     if (Radio.hasSecondRadioGotData)
     {
+#ifdef USE_ENCRYPTION
+        if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+        {
+            DecryptMsg( Radio.RXdataBufferSecond );
+        }
+#endif
         if (!OtaValidatePacketCrc(otaPktPtrSecond))
         {
             Radio.hasSecondRadioGotData = false;
@@ -1219,6 +1318,9 @@ void ICACHE_RAM_ATTR TXdoneISR()
  **/
 void DataUlReceiveComplete()
 {
+#ifdef USE_ENCRYPTION
+	encryption_params_t *encryption_params;
+#endif
     switch (DataUlBuffer[0])
     {
     case MSP_ELRS_SET_RX_WIFI_MODE: //0x0E
@@ -1228,6 +1330,17 @@ void DataUlReceiveComplete()
             setWifiUpdateMode();
         });
         break;
+
+#ifdef USE_ENCRYPTION
+	case MSP_ELRS_INIT_ENCRYPT:
+        DBGLN("DataUlBuffer = %d, %d, %d, %d, %d, %d", DataUlBuffer[1], DataUlBuffer[2], DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5], DataUlBuffer[6]);
+
+	    encryption_params = (encryption_params_t *) &DataUlBuffer[1];
+		CryptoSetKeys(encryption_params);
+		encryptionStateSend = ENCRYPTION_STATE_FULL;
+		break;
+#endif
+
     case MSP_ELRS_MAVLINK_TLM: // 0xFD
         // raw mavlink data
         if (config.GetSerialProtocol() == PROTOCOL_MAVLINK)

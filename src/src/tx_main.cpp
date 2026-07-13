@@ -29,6 +29,22 @@ void sendCRSFTelemetryToBackpack(uint8_t *) {}
 void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #endif
 
+#ifdef USE_ENCRYPTION
+#include <encryption.h>
+#include <Crypto.h>
+#include <ChaCha.h>
+#include <string.h>
+#if defined(ESP8266) || defined(ESP32)
+#include <pgmspace.h>
+#else
+#include <avr/pgmspace.h>
+#endif
+ChaCha cipher(20);  // ChaCha20 - RFC 8439 standard (Finding #5)
+uint8_t encryptionCounter[8];
+encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
+encryption_params_t nonce_key;
+#endif
+
 #include "CRSFParser.h"
 #include "CRSFRouter.h"
 #include "MAVLink.h"
@@ -81,7 +97,11 @@ LQCALC<100> LqTQly;
 volatile bool busyTransmitting;
 static volatile bool ModelUpdatePending;
 
+#ifdef USE_ENCRYPTION
+uint8_t MSPDataPackage[ELRS_DATA_UL_BUFFER];
+#else
 uint8_t MSPDataPackage[5];
+#endif
 #define BindingSpamAmount 25
 static uint8_t BindingSendCount;
 bool RxWiFiReadyToSend = false;
@@ -169,6 +189,135 @@ void ICACHE_RAM_ATTR LinkStatsFromOta(OTA_LinkStats_s * const ls)
   }
 }
 
+#ifdef USE_ENCRYPTION
+
+// TODO test random functions on both RADIO_SX127X and RADIO_SX128X,
+// then delete unused functions.
+#ifdef RADIO_SX127X
+void RandRSSI(uint8_t *outrnd, size_t len)
+{
+  uint8_t rnd;
+
+  for (int i = 0; i < len; i++)
+  {
+    Radio.SetMode(SX127x_OPMODE_CAD, SX12XX_Radio_1);
+    rnd = 0;
+    for (uint8_t bit = 0; bit < 8; bit++)
+    {
+        delay(1);
+        rnd |= ( Radio.GetCurrRSSI(SX12XX_Radio_1) & 0x01 ) << bit;
+    }
+    outrnd[i] = rnd;
+  }
+
+}
+#endif
+
+#ifdef RADIO_SX128X
+void RandRSSI(uint8_t *outrnd, size_t len)
+{
+
+  uint8_t rnd;
+
+  Radio.RXnb(SX1280_MODE_RX_CONT);
+
+  for (int i = 0; i < len; i++)
+  {
+    rnd = 0;
+    for (uint8_t bit = 0; bit < 8; bit++)
+    {
+        delay(1);
+        rnd |= ( Radio.GetRssiInst(SX12XX_Radio_1) & 0x01 ) << bit;
+    }
+    outrnd[i] = rnd;
+  }
+}
+
+
+#endif
+
+#ifdef RADIO_LR1121
+void RandRSSI(uint8_t *outrnd, size_t len)
+{
+
+  uint8_t rnd;
+
+  Radio.RXnb(LR1121_MODE_RX_CONT);
+
+  for (int i = 0; i < len; i++)
+  {
+    rnd = 0;
+    for (uint8_t bit = 0; bit < 8; bit++)
+    {
+        delay(1);
+        rnd |= ( Radio.GetRssiInst(SX12XX_Radio_1) & 0x01 ) << bit;
+    }
+    outrnd[i] = rnd;
+  }
+}
+
+
+#endif
+
+bool InitCrypto()
+{
+
+  encryption_params_t *enc_params;
+  uint8_t rounds = 12;
+  size_t counterSize = 8;
+  size_t keySize = 16;
+
+  uint8_t counter[] = {109, 110, 111, 112, 113, 114, 115, 116};
+
+  memcpy(encryptionCounter, counter, counterSize);
+  cipher.clear();
+
+  unsigned char *master_key = (unsigned char *) calloc( keySize + 1, sizeof(char) );
+  hexStr2Arr( master_key, stringify_expanded(USE_ENCRYPTION), keySize );
+
+  cipher.setNumRounds(rounds);
+  if ( !cipher.setKey(master_key, keySize) )
+  {
+      return false;
+  }
+  if ( !cipher.setIV(nonce_key.nonce, cipher.ivSize()) )
+  {
+      return false;
+  }
+  if (!cipher.setCounter(counter, counterSize))
+  {
+      return false;
+  }
+
+  // Encrypt the session key and send it
+  MSPDataPackage[0] = MSP_ELRS_INIT_ENCRYPT;
+  enc_params = (encryption_params_t *) &MSPDataPackage[1];
+  memcpy( enc_params->nonce, nonce_key.nonce, cipher.ivSize() );
+  memcpy( enc_params->key, nonce_key.key, keySize );
+
+  cipher.encrypt(enc_params->key, enc_params->key, keySize);
+  free(master_key);
+
+  DataUlSender.SetDataToTransmit(MSPDataPackage, sizeof(encryption_params_t) + 1);
+
+  // Further packets are encrypted with the session key
+  if ( !cipher.setKey(nonce_key.key, keySize) )
+  {
+      return false;
+  }
+  if ( !cipher.setIV(nonce_key.nonce, cipher.ivSize()) )
+  {
+      return false;
+  }
+  if (!cipher.setCounter(counter, counterSize))
+  {
+      return false;
+  }
+
+  return true;
+}
+#endif
+
 /***
  * @brief Receive downlink data from payload buffers in OTA_Packet_s structures and merge Gemini payload buffers
  * @param pi1 packageIndex from Radio.RXdataBuffer
@@ -234,6 +383,13 @@ static bool ICACHE_RAM_ATTR ProcessDownlinkPacket(SX12xxDriverCommon::rx_status 
     return false;
   }
 
+#ifdef USE_ENCRYPTION
+  if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+  {
+    DecryptMsg( Radio.RXdataBuffer );
+  }
+#endif
+
   OTA_Packet_s * const otaPktPtr = (OTA_Packet_s * const)Radio.RXdataBuffer;
   OTA_Packet_s * const otaPktPtrSecond = (OTA_Packet_s * const)Radio.RXdataBufferSecond;
 
@@ -249,6 +405,12 @@ static bool ICACHE_RAM_ATTR ProcessDownlinkPacket(SX12xxDriverCommon::rx_status 
   Radio.CheckForSecondPacket();
   if (Radio.hasSecondRadioGotData)
   {
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+      DecryptMsg( Radio.RXdataBufferSecond );
+    }
+#endif
     if (!OtaValidatePacketCrc(otaPktPtrSecond))
     {
       Radio.hasSecondRadioGotData = false;
@@ -641,6 +803,13 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
   else
 #endif
   {
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+      EncryptMsg( (uint8_t*)&otaPkt, (uint8_t*)&otaPkt );
+    }
+#endif
+
     Radio.TXnb((uint8_t*)&otaPkt, false, (uint8_t*)&otaPkt, transmittingRadio);
   }
 }
@@ -1464,6 +1633,10 @@ void setup()
       // Set the pkt rate, TLM ratio, and power from the stored eeprom values
       ChangeRadioParams();
 
+#ifdef USE_ENCRYPTION
+      // Should be a good time to do this, because the radio is put into continuous recv mode here
+      RandRSSI( (uint8_t *) &nonce_key, 24);
+#endif
       LbtCcaTimerStart();
       hwTimer::init(nullptr, timerCallback);
       setConnectionState(noCrossfire);
@@ -1560,6 +1733,22 @@ void loop()
       }
       DataDlReceiver.Unlock();
   }
+
+#ifdef USE_ENCRYPTION
+  if ( (connectionState == connected) && (!DataUlSender.IsActive()) )
+  {
+    if (encryptionStateSend == ENCRYPTION_STATE_NONE)
+	{
+      InitCrypto();
+      encryptionStateSend = ENCRYPTION_STATE_PROPOSED;
+    }
+	  else if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED )
+	  {
+        // DataUlSender.IsActive() will be true until our proposal msg is ack'ed
+        encryptionStateSend = ENCRYPTION_STATE_FULL;
+	  }
+  }
+#endif
 
   // only send Uplink data when binding is not active
   if (InBindingMode)
