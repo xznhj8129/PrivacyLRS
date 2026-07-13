@@ -449,7 +449,7 @@ bool CryptoSetKeys(encryption_params_t *params)
 {
     uint8_t rounds = 20;  // ChaCha20 - RFC 8439 standard (Finding #5)
     size_t counterSize = 8;
-    size_t keySize = 16;
+    size_t keySize = 32;  // 256-bit keys (Finding #3)
 
     uint8_t counter[]     = {109, 110, 111, 112, 113, 114, 115, 116};
 

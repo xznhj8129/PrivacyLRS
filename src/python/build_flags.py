@@ -74,9 +74,10 @@ def process_build_flag(define):
             define = "-DMY_UID=" + UIDbytes
             sys.stdout.write("\u001b[32mUID bytes: " + UIDbytes + "\n")
 
+            # Full SHA-256 digest as the 256-bit master key (Finding #3)
             stronghash=hashlib.sha256(define.encode()).hexdigest()
-            define = "-DUSE_ENCRYPTION=\"" + stronghash[0:32] + "\""
-            sys.stdout.write("\u001b[32mUSE_ENCRYPTION: " + stronghash[0:32] + "\n")
+            define = "-DUSE_ENCRYPTION=\"" + stronghash + "\""
+            sys.stdout.write("\u001b[32mUSE_ENCRYPTION: " + stronghash + "\n")
             sys.stdout.flush()
         if "HOME_WIFI_SSID=" in define:
             parts = re.search(r"(.*)=\w*\"(.*)\"$", define)

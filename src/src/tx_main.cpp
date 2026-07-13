@@ -39,6 +39,9 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #else
 #include <avr/pgmspace.h>
 #endif
+#if !defined(PLATFORM_ESP8266)
+#include <esp_system.h>  // esp_random() hardware TRNG
+#endif
 ChaCha cipher(20);  // ChaCha20 - RFC 8439 standard (Finding #5)
 uint8_t encryptionCounter[8];
 encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
@@ -219,7 +222,7 @@ void RandRSSI(uint8_t *outrnd, size_t len)
 
   uint8_t rnd;
 
-  Radio.RXnb(SX1280_MODE_RX_CONT);
+  Radio.RXnb();
 
   for (int i = 0; i < len; i++)
   {
@@ -242,7 +245,7 @@ void RandRSSI(uint8_t *outrnd, size_t len)
 
   uint8_t rnd;
 
-  Radio.RXnb(LR1121_MODE_RX_CONT);
+  Radio.RXnb();
 
   for (int i = 0; i < len; i++)
   {
@@ -259,13 +262,28 @@ void RandRSSI(uint8_t *outrnd, size_t len)
 
 #endif
 
+// Session key/nonce entropy: radio RSSI noise mixed with the SoC hardware
+// TRNG, so neither source alone has to be perfect (Finding #8)
+static void CollectEntropy(uint8_t *out, size_t len)
+{
+  RandRSSI(out, len);
+  for (size_t i = 0; i < len; i++)
+  {
+#if defined(PLATFORM_ESP8266)
+    out[i] ^= (uint8_t)RANDOM_REG32;
+#else
+    out[i] ^= (uint8_t)esp_random();
+#endif
+  }
+}
+
 bool InitCrypto()
 {
 
   encryption_params_t *enc_params;
   uint8_t rounds = 20;  // ChaCha20 - RFC 8439 standard (Finding #5)
   size_t counterSize = 8;
-  size_t keySize = 16;
+  size_t keySize = 32;  // 256-bit keys (Finding #3)
 
   uint8_t counter[] = {109, 110, 111, 112, 113, 114, 115, 116};
 
@@ -1635,7 +1653,7 @@ void setup()
 
 #ifdef USE_ENCRYPTION
       // Should be a good time to do this, because the radio is put into continuous recv mode here
-      RandRSSI( (uint8_t *) &nonce_key, 24);
+      CollectEntropy( (uint8_t *) &nonce_key, sizeof(nonce_key));
 #endif
       LbtCcaTimerStart();
       hwTimer::init(nullptr, timerCallback);

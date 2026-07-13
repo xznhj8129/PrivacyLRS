@@ -42,7 +42,7 @@ typedef enum : uint8_t {
 typedef struct encryption_params_s
 {
     uint8_t nonce[8];
-    uint8_t key[16];
+    uint8_t key[32];  // 256-bit session key (Finding #3)
 
 } encryption_params_t;
 
