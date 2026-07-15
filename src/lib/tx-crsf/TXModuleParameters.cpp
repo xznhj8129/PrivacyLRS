@@ -396,15 +396,18 @@ void TXModuleEndpoint::sendELRSstatus(const crsf_addr_e origin)
   setWarningFlag(LUA_FLAG_MODEL_MATCH, connectionState == connected && connectionHasModelMatch == false);
   setWarningFlag(LUA_FLAG_CONNECTED, connectionState == connected);
   setWarningFlag(LUA_FLAG_ISARMED, handset->IsArmed());
-#ifdef USE_ENCRYPTION
-  // Temporary bench diagnostics: status bit 1 means session proposal active;
-  // warning bit 4 means ciphers active. Both reserved bits have empty messages.
+#if defined(USE_ENCRYPTION) && defined(CRYPTO_BENCH_DIAGNOSTICS)
+  // Bench diagnostics (opt-in via -DCRYPTO_BENCH_DIAGNOSTICS): status bit 1
+  // means session proposal active; warning bit 4 means ciphers active. Both
+  // reserved bits have empty messages. Off by default so a release build keeps
+  // the stock status/warning bit meanings.
   setWarningFlag(LUA_FLAG_STATUS1, encryptionStateSend == ENCRYPTION_STATE_PROPOSED);
   setWarningFlag(LUA_FLAG_WARNING1, encryptionStateSend == ENCRYPTION_STATE_FULL);
 #endif
 
-#ifdef USE_ENCRYPTION
-  // Temporary bench diagnostics for the reliable crypto proposal transfer.
+#if defined(USE_ENCRYPTION) && defined(CRYPTO_BENCH_DIAGNOSTICS)
+  // Bench diagnostics for the reliable crypto proposal transfer, overloading the
+  // stock handset packet counts. Opt-in only; see the note above.
   params->pktsBad = ((uint8_t)DataUlSender.GetState() << 4)
       | ((uint8_t)DataUlSender.GetExpectedConfirm() << 3)
       | (DataUlSender.GetCurrentPackage() & 0x07);

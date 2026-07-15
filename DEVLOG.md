@@ -184,3 +184,9 @@ Configuration: initial 2.4 GHz at 150 Hz, telemetry 1:2, 75-second transition ti
 - The `packets_bad=11 packets_good=0` in the sweep output is the still-present temporary diagnostic overload (finding #4), not a link failure.
 - Still open and untouched this session: temporary status-field diagnostics (finding #4), separate proposal timeout vs the shared 10 s grace constant (finding #2), the unacknowledged 16-SYNC activation barrier (finding #3), and K1000 sustained operation on this bench (finding #5, expected UART limit).
 
+## 2026-07-14 - status-field diagnostics made opt-in (finding #4)
+
+- Put the temporary TX status diagnostics behind a dedicated `CRYPTO_BENCH_DIAGNOSTICS` compile flag (in addition to `USE_ENCRYPTION`), default off. Release encrypted builds now restore the stock `pktsBad`/`pktsGood` handset packet counts and leave the reserved `LUA_FLAG_STATUS1`/`LUA_FLAG_WARNING1` bits clear.
+- With `-DCRYPTO_BENCH_DIAGNOSTICS` the bench behaviour is unchanged: `pktsBad` carries StubbornSender state/expected-confirm/package, `pktsGood` carries the wait count, and the two reserved bits expose PROPOSED/FULL. This is how the `packets_bad=11` values appeared in earlier sweep output.
+- TX build passes with the flag off. No RF/link logic changed; only which values populate the status fields.
+
