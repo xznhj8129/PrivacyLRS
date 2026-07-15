@@ -174,3 +174,13 @@ Configuration: initial 2.4 GHz at 150 Hz, telemetry 1:2, 75-second transition ti
 - Cleanup required before release: remove or build-gate the temporary status-field diagnostics so `pktsBad`, `pktsGood`, and reserved warning bits recover their standard meanings.
 - Security boundary unchanged: packets are encrypted for passive-observer privacy but not authenticated. Valid plaintext recovery control can still be used by an active attacker to disrupt or reset sessions.
 
+## 2026-07-14 - band-change rate preservation (primary defect fixed)
+
+- Fixed the high-severity band-change defect (CODE_REVIEW finding #1). The `luaRFBand` callback in `src/lib/tx-crsf/TXModuleParameters.cpp` scanned the rate table from index zero and applied the fastest supported rate in the destination band, which selected K1000 on the 915 MHz to 2.4 GHz return and stranded the encrypted link.
+- Under `USE_ENCRYPTION`, a band change now preserves the current nominal rate when the destination band offers it (rates share the same `interval`, e.g. 250 Hz == 4000 us in every band), and otherwise falls back to a conservative transition rate of at most 250 Hz. Stock (non-encrypted) behaviour is unchanged behind the `#else` branch.
+- Built HEAD + fix onto both units (`fa54be`), re-verified, and re-ran smoke and the committed rf-sweep.
+  - Smoke: 8 PASS + 1 SKIP (flash_probe skipped on the shared handset port). Link up 1.6 s, RC delivery 99.9 %, telemetry return OK. No regression from the checkpoint code.
+  - rf-sweep (2.4 GHz + 915 MHz, `test_rates = none`): all transitions PASS, exit 0. Initial 2.4 GHz 150 Hz 21.1 s; 2.4 GHz to 915 MHz held 250 Hz, 12.3 s; **915 MHz to 2.4 GHz return now holds 250 Hz and re-establishes in 1.6 s, LQ 100, 100 % RC, zero dropouts** (previously K1000, LQ 0, failed within 75 s); restore to 150 Hz 13.6 s.
+- The `packets_bad=11 packets_good=0` in the sweep output is the still-present temporary diagnostic overload (finding #4), not a link failure.
+- Still open and untouched this session: temporary status-field diagnostics (finding #4), separate proposal timeout vs the shared 10 s grace constant (finding #2), the unacknowledged 16-SYNC activation barrier (finding #3), and K1000 sustained operation on this bench (finding #5, expected UART limit).
+

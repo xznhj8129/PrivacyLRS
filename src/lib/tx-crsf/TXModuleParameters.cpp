@@ -849,6 +849,44 @@ void TXModuleEndpoint::registerParameters()
       registerParameter(&luaRFBand, [this](propertiesCommon *item, uint8_t arg) {
         if (arg != rfMode)
         {
+#ifdef USE_ENCRYPTION
+          // Stock ELRS jumps to the fastest supported rate in the destination
+          // band (e.g. K1000 on 2.4GHz). The encrypted link cannot sustain that
+          // through a live band change, so preserve the current nominal rate
+          // when the destination band offers it (rates share the same interval
+          // across bands, e.g. 250Hz == 4000us everywhere), and otherwise fall
+          // back to a conservative transition rate of at most 250Hz.
+          const int32_t transitionMinIntervalUs = 4000; // 250Hz
+          const int32_t previousInterval = ExpressLRS_currAirRate_Modparams->interval;
+          rfMode = static_cast<RFMode>(arg);
+          int selected = -1;     // in-band rate matching the current interval
+          int conservative = -1; // fastest in-band rate no faster than the cap
+          int slowest = -1;      // slowest in-band rate, ultimate fallback
+          for (int i=0; i < RATE_MAX ; i++)
+          {
+            if (!isSupportedRFRate(i))
+              continue;
+            const auto radio_type = get_elrs_airRateConfig(i)->radio_type;
+            const bool inBand =
+              (rfMode == RF_MODE_900 && (radio_type == RADIO_TYPE_LR1121_GFSK_900 || radio_type == RADIO_TYPE_LR1121_LORA_900)) ||
+              (rfMode == RF_MODE_2G4 && (radio_type == RADIO_TYPE_LR1121_GFSK_2G4 || radio_type == RADIO_TYPE_LR1121_LORA_2G4)) ||
+              (rfMode == RF_MODE_DUAL && radio_type == RADIO_TYPE_LR1121_LORA_DUAL);
+            if (!inBand)
+              continue;
+            const int32_t interval = get_elrs_airRateConfig(i)->interval;
+            if (interval == previousInterval && selected < 0)
+              selected = i;
+            if (interval >= transitionMinIntervalUs &&
+                (conservative < 0 || interval < get_elrs_airRateConfig(conservative)->interval))
+              conservative = i;
+            if (slowest < 0 || interval > get_elrs_airRateConfig(slowest)->interval)
+              slowest = i;
+          }
+          if (selected < 0)
+            selected = (conservative >= 0) ? conservative : slowest;
+          if (selected >= 0)
+            SetPacketRateIdx(selected, true);
+#else
           // Choose the fastest supported packet rate in this RF band.
           rfMode = static_cast<RFMode>(arg);
           for (int i=0; i < RATE_MAX ; i++)
@@ -873,6 +911,7 @@ void TXModuleEndpoint::registerParameters()
               }
             }
           }
+#endif
           recalculatePacketRateOptions(handset->getMinPacketInterval());
         }
       });
