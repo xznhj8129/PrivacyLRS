@@ -7,6 +7,7 @@ import json
 from json import JSONEncoder
 import mmap
 import hashlib
+import re
 from enum import Enum
 import shutil
 
@@ -179,7 +180,10 @@ def main():
     parser.add_argument('--dir', action=readable_dir, default=None, help='The directory that contains the "hardware" and other firmware directories')
     parser.add_argument('--fdir', action=readable_dir, default=None, help='If specified, then the firmware files are loaded from this directory')
     # Bind phrase
-    parser.add_argument('--phrase', type=str, help='Your personal binding phrase')
+    phrase = parser.add_mutually_exclusive_group()
+    phrase.add_argument('--phrase', type=str, help='Your personal binding phrase')
+    phrase.add_argument('--phrase-defines', type=str,
+                        help='Read MY_BINDING_PHRASE from a user_defines file')
     parser.add_argument('--flash-discriminator', type=int, default=randint(1,2**32-1), dest='flash_discriminator', help='Force a fixed flash-descriminator instead of random')
     # WiFi Params
     parser.add_argument('--ssid', type=length_check(32, "ssid"), required=False, help='Home network SSID')
@@ -220,6 +224,12 @@ def main():
     parser.add_argument("file", nargs="?", type=argparse.FileType("r+b"))
 
     args = parser.parse_args()
+
+    if args.phrase_defines is not None:
+        with open(args.phrase_defines, encoding='utf-8') as defines_file:
+            defines = defines_file.read()
+        args.phrase = re.search(
+            r'^\s*-DMY_BINDING_PHRASE="(.+)"\s*$', defines, re.MULTILINE).group(1)
 
     if args.dir is not None:
         os.chdir(args.dir)

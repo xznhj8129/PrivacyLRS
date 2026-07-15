@@ -10,6 +10,13 @@
 #include "helpers.h"
 #include "deferred.h"
 #include "msptypes.h"
+#ifdef USE_ENCRYPTION
+#include "encryption.h"
+#include "stubborn_sender.h"
+extern encryptionState_e encryptionStateSend;
+extern uint64_t cryptoSlot;
+extern StubbornSender DataUlSender;
+#endif
 
 #define STR_LUA_ALLAUX         "AUX1;AUX2;AUX3;AUX4;AUX5;AUX6;AUX7;AUX8;AUX9;AUX10"
 
@@ -389,9 +396,23 @@ void TXModuleEndpoint::sendELRSstatus(const crsf_addr_e origin)
   setWarningFlag(LUA_FLAG_MODEL_MATCH, connectionState == connected && connectionHasModelMatch == false);
   setWarningFlag(LUA_FLAG_CONNECTED, connectionState == connected);
   setWarningFlag(LUA_FLAG_ISARMED, handset->IsArmed());
+#ifdef USE_ENCRYPTION
+  // Temporary bench diagnostics: status bit 1 means session proposal active;
+  // warning bit 4 means ciphers active. Both reserved bits have empty messages.
+  setWarningFlag(LUA_FLAG_STATUS1, encryptionStateSend == ENCRYPTION_STATE_PROPOSED);
+  setWarningFlag(LUA_FLAG_WARNING1, encryptionStateSend == ENCRYPTION_STATE_FULL);
+#endif
 
+#ifdef USE_ENCRYPTION
+  // Temporary bench diagnostics for the reliable crypto proposal transfer.
+  params->pktsBad = ((uint8_t)DataUlSender.GetState() << 4)
+      | ((uint8_t)DataUlSender.GetExpectedConfirm() << 3)
+      | (DataUlSender.GetCurrentPackage() & 0x07);
+  params->pktsGood = htobe16(DataUlSender.GetWaitCount());
+#else
   params->pktsBad = CRSFHandset::BadPktsCountResult;
   params->pktsGood = htobe16(CRSFHandset::GoodPktsCountResult);
+#endif
   params->flags = luaWarningFlags;
   // to support sending a params.msg, buffer should be extended by the strlen of the message
   // and copied into params->msg (with trailing null)

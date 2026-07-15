@@ -200,7 +200,12 @@ if env.get('PIOPLATFORM', '') == 'espressif8266':
 
 env['OPTIONS_JSON'] = json_flags
 env['BUILD_FLAGS'] = build_flags
-display_flags = ["-DUSE_ENCRYPTION=\"[redacted]\"" if "USE_ENCRYPTION" in flag else flag for flag in build_flags]
+display_flags = list(build_flags)
+for index, flag in enumerate(display_flags):
+    for secret_name in ("USE_ENCRYPTION", "HOME_WIFI_SSID", "HOME_WIFI_PASSWORD"):
+        if flag.startswith(f"-D{secret_name}="):
+            display_flags[index] = f'-D{secret_name}="[redacted]"'
+            break
 sys.stdout.write("\nbuild flags: %s\n\n" % display_flags)
 
 if fnmatch.filter(build_flags, '*PLATFORM_ESP32*'):

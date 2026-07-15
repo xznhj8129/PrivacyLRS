@@ -63,10 +63,13 @@
 #include <avr/pgmspace.h>
 #endif
 ChaCha cipherUplink(20);
-ChaCha cipherDownlink(20);
+ChaCha cipherDownlinkRadio1(20);
+ChaCha cipherDownlinkRadio2(20);
 encryptionState_e encryptionStateSend = ENCRYPTION_STATE_NONE;
-uint8_t encryptionCounterUplink[8];
-uint8_t encryptionCounterDownlink[8];
+uint64_t cryptoSlot;
+static bool cryptoControlResponsePending;
+static bool cryptoSlotAnchorEstablished;
+static volatile uint32_t lastEncryptedUplinkMs;
 #endif
 //
 // Code encapsulated by the ARDUINO_CORE_INVERT_FIX #ifdef temporarily fixes EpressLRS issue #2609 which is caused
@@ -303,6 +306,25 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
     linkStats.uplink_SNR = SNR_DESCALE(Radio.LastPacketSNRRaw); // possibly overriden below
     //linkStats.uplink_Link_quality = uplinkLQ; // handled in Tick
     linkStats.rf_Mode = ExpressLRS_currAirRate_Modparams->enum_rate;
+#ifdef USE_ENCRYPTION
+    // Temporary bench diagnostics in the otherwise unused high bits.
+    if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+    {
+        linkStats.rf_Mode |= 0x40;
+    }
+    else if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    {
+        linkStats.rf_Mode |= 0x80;
+    }
+    linkStats.uplink_RSSI_1 = OtaNonce;
+    linkStats.uplink_RSSI_2 = CryptoGetLastResetNonce();
+    linkStats.uplink_SNR = constrain(CryptoGetReceiveOffsetRadio1(), -128, 127);
+    linkStats.active_antenna = (uint8_t)cryptoSlot;
+    linkStats.uplink_TX_Power = (uint8_t)(cryptoSlot >> 8);
+    linkStats.downlink_RSSI_1 = (uint8_t)(cryptoSlot >> 16);
+    linkStats.downlink_Link_quality = (uint8_t)(cryptoSlot >> 24);
+    linkStats.downlink_SNR = (uint8_t)(cryptoSlot >> 32);
+#endif
     //DBGLN(linkStats.uplink_RSSI_1);
     #if defined(DEBUG_BF_LINK_STATS)
     linkStats.downlink_RSSI_1 = debug1;
@@ -412,7 +434,11 @@ static void ICACHE_RAM_ATTR HandleFHSS()
 #if defined(RADIO_SX127X)
     // SX127x radio has to reset receive mode after hopping
     uint8_t modresultTLM = OtaNonce % ExpressLRS_currTlmDenom;
-    if (modresultTLM != 0 || ExpressLRS_currTlmDenom == 1) // if we are about to send a tlm response don't bother going back to rx
+    if ((modresultTLM != 0 || ExpressLRS_currTlmDenom == 1)
+#ifdef USE_ENCRYPTION
+        && !cryptoControlResponsePending
+#endif
+       ) // if we are about to send a tlm response don't bother going back to rx
     {
         Radio.RXnb();
     }
@@ -447,41 +473,14 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 
 #ifdef USE_ENCRYPTION
 
-bool CryptoSetKeys(encryption_params_t *params)
+bool CryptoSetSession(session_proposal_t const *proposal)
 {
-    size_t counterSize = 8;
-    size_t keySize = 32;  // 256-bit keys (Finding #3)
+    uint8_t master_key[32];
+    uint8_t session_key[32];
 
-    uint8_t counter[]     = {109, 110, 111, 112, 113, 114, 115, 116};
-    ChaCha masterCipher(20);
-
-
-    // Decrypt the session key, which is encrypted with the master key
-    unsigned char *master_key = (unsigned char *) calloc( keySize + 1, sizeof(char) );
-    hexStr2Arr( master_key, stringify_expanded(USE_ENCRYPTION), keySize );
-    DBGLN_KEY("encrypted session key = %d, %d, %d, %d", params->key[0], params->key[1], params->key[2], params->key[3]);
-    DBGLN_KEY("master_key = %d, %d, %d, %d", master_key[0], master_key[1], master_key[2], master_key[3]);
-
-    if ( !masterCipher.setKey(master_key, keySize) )
-    {
-        return false;
-    }
-    if ( !masterCipher.setIV(params->nonce, sizeof(params->nonce)) )
-    {
-        return false;
-    }
-    if (!masterCipher.setCounter(counter, counterSize))
-    {
-        return false;
-    }
-    masterCipher.decrypt(params->key, params->key, keySize);
-    free(master_key);
-
-
-    DBGLN_KEY("New key = dec: %d, %d, %d hex:  %x, %x, %x", params->key[0], params->key[1], params->key[2], params->key[3],
-    params->key[4], params->key[5], params->key[6]);
-
-    return InitSessionCiphers(params->key, params->nonce);
+    hexStr2Arr(master_key, stringify_expanded(USE_ENCRYPTION), sizeof(master_key));
+    if (!DeriveSessionKey(master_key, proposal->nonce, session_key)) return false;
+    return InitSessionCiphers(session_key, proposal->nonce);
 }
 
 #endif
@@ -512,7 +511,33 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
 {
     uint8_t modresult = OtaNonce % ExpressLRS_currTlmDenom;
 
-    if ((connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) || (alreadyTLMresp == true) || (modresult != 0) || !teamraceHasModelMatch)
+#ifdef USE_ENCRYPTION
+    // Session setup needs one acknowledgement path independent of the user's
+    // normal telemetry policy. This slot carries LinkStats only.
+    const bool cryptoControlSlot = !InBindingMode && cryptoControlResponsePending;
+    if (cryptoControlSlot && encryptionStateSend == ENCRYPTION_STATE_NONE
+        && DataUlReceiver.HasFinishedData())
+    {
+        // The final proposal acknowledgement must wait until the main loop has
+        // installed the new session ciphers.
+        return false;
+    }
+#endif
+
+    if ((connectionState == disconnected
+#ifdef USE_ENCRYPTION
+        && !cryptoControlSlot
+#endif
+       )
+#ifdef USE_ENCRYPTION
+        || (encryptionStateSend != ENCRYPTION_STATE_FULL && !cryptoControlSlot)
+        || (!cryptoControlSlot && ExpressLRS_currTlmDenom == 1)
+        || (!cryptoControlSlot && modresult != 0)
+#else
+        || (ExpressLRS_currTlmDenom == 1)
+        || (modresult != 0)
+#endif
+        || (alreadyTLMresp == true) || !teamraceHasModelMatch)
     {
         return false; // don't bother sending tlm if disconnected or TLM is off
     }
@@ -542,9 +567,34 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     }
 #endif
 
-    if (NextTelemetryType == PACKET_TYPE_LINKSTATS || !tlmQueued)
+    if (
+#ifdef USE_ENCRYPTION
+        cryptoControlSlot ||
+#endif
+        NextTelemetryType == PACKET_TYPE_LINKSTATS || !tlmQueued)
     {
         otaPkt.std.type = PACKET_TYPE_LINKSTATS;
+#ifdef USE_ENCRYPTION
+        if (cryptoControlSlot)
+        {
+            if (OtaIsFullRes)
+            {
+                otaPkt.full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+                LinkStatsToOta(&otaPkt.full.data_dl.ul_link_stats.stats);
+            }
+            else
+            {
+                otaPkt.std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+                LinkStatsToOta(&otaPkt.std.data_dl.ul_link_stats.stats);
+            }
+            if (geminiMode)
+            {
+                sendGeminiBuffer = true;
+                otaPktGemini = otaPkt;
+            }
+        }
+        else
+#endif
         if (OtaIsFullRes)
         {
             GenerateOtaDataDl(full, data_dl.ul_link_stats,
@@ -587,14 +637,12 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
         }
     }
 
-    OtaGeneratePacketCrc(&otaPkt);
-    if (sendGeminiBuffer)
-    {
-        OtaGeneratePacketCrc(&otaPktGemini);
-    }
-
     SX12XX_Radio_Number_t transmittingRadio;
-    if (config.GetForceTlmOff())
+    if (config.GetForceTlmOff()
+#ifdef USE_ENCRYPTION
+        && !cryptoControlSlot
+#endif
+       )
     {
         transmittingRadio = SX12XX_Radio_NONE;
     }
@@ -608,12 +656,63 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     }
 
 #ifdef USE_ENCRYPTION
-    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    if (cryptoControlSlot && transmittingRadio != SX12XX_Radio_NONE)
     {
-      EncryptMsg( (uint8_t*)&otaPkt, (uint8_t*)&otaPkt );
+      // Anchor once when the first final proposal acknowledgement is sent.
+      // Retries must advance from that anchor: resetting again after TX has
+      // accepted an earlier acknowledgement splits the session clocks.
+      if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED
+          && !cryptoSlotAnchorEstablished)
+      {
+        CryptoResetSlot(OtaNonce);
+        cryptoSlotAnchorEstablished = true;
+      }
+      uint16_t const anchor = CryptoGetSlot();
+      OTA_LinkStats_s * const stats = OtaIsFullRes
+          ? &otaPkt.full.data_dl.ul_link_stats.stats
+          : &otaPkt.std.data_dl.ul_link_stats.stats;
+      ((uint8_t *)stats)[0] = anchor;
+      ((uint8_t *)stats)[1] = anchor >> 8;
       if (sendGeminiBuffer)
       {
-        EncryptMsg( (uint8_t*)&otaPktGemini, (uint8_t*)&otaPktGemini );
+        OTA_LinkStats_s * const geminiStats = OtaIsFullRes
+            ? &otaPktGemini.full.data_dl.ul_link_stats.stats
+            : &otaPktGemini.std.data_dl.ul_link_stats.stats;
+        ((uint8_t *)geminiStats)[0] = anchor;
+        ((uint8_t *)geminiStats)[1] = anchor >> 8;
+      }
+      cryptoControlResponsePending = false;
+    }
+#endif
+
+    OtaGeneratePacketCrc(&otaPkt);
+    if (sendGeminiBuffer)
+    {
+        OtaGeneratePacketCrc(&otaPktGemini);
+    }
+
+#ifdef USE_ENCRYPTION
+    // A denied LBT slot sends no packet, so no buffer needs encryption.
+    if (encryptionStateSend == ENCRYPTION_STATE_FULL && transmittingRadio != SX12XX_Radio_NONE)
+    {
+      if (sendGeminiBuffer)
+      {
+        const bool radio1UsesPrimary = (OtaNonce/ExpressLRS_currAirRate_Modparams->FHSShopInterval) % 2 == 0 || FHSSuseDualBand;
+        OTA_Packet_s * const radio1Packet = radio1UsesPrimary ? &otaPkt : &otaPktGemini;
+        OTA_Packet_s * const radio2Packet = radio1UsesPrimary ? &otaPktGemini : &otaPkt;
+
+        if (transmittingRadio & SX12XX_Radio_1)
+        {
+          EncryptMsgForRadio((uint8_t *)radio1Packet, (uint8_t *)radio1Packet, false);
+        }
+        if (transmittingRadio & SX12XX_Radio_2)
+        {
+          EncryptMsgForRadio((uint8_t *)radio2Packet, (uint8_t *)radio2Packet, true);
+        }
+      }
+      else
+      {
+        EncryptMsgForRadio((uint8_t *)&otaPkt, (uint8_t *)&otaPkt, transmittingRadio == SX12XX_Radio_2);
       }
     }
 #endif
@@ -631,13 +730,8 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
     }
 
 #ifdef USE_ENCRYPTION
-    // The session-key proposal is acknowledged by this first downlink packet.
-    // Keep that acknowledgement plaintext so the TX can confirm the proposal
-    // and begin decrypting on the following packet.
-    if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED && transmittingRadio != SX12XX_Radio_NONE)
-    {
-        encryptionStateSend = ENCRYPTION_STATE_FULL;
-    }
+    // Stay PROPOSED until an encrypted uplink proves that TX received the
+    // plaintext proposal acknowledgement. Lost acknowledgements are retried.
 #endif
 
     if (transmittingRadio == SX12XX_Radio_NONE)
@@ -872,6 +966,12 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
     sendImmediateRC();
 
     OtaNonce++;
+#ifdef USE_ENCRYPTION
+    if (!InBindingMode)
+    {
+        CryptoAdvanceSlot();
+    }
+#endif
     HandleFHSS();
     updateDiversity();
     bool tlmSent = HandleSendDataDl();
@@ -903,6 +1003,9 @@ void LostConnection(bool resumeRx)
     LPF_Offset.init(0);
     LPF_OffsetDx.init(0);
     alreadyTLMresp = false;
+#ifdef USE_ENCRYPTION
+    cryptoControlResponsePending = false;
+#endif
 
     if (!InBindingMode)
     {
@@ -1017,7 +1120,11 @@ void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t* newUid4)
 
 static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(OTA_Packet_s const * const otaPktPtr)
 {
-    if (firmwareOptions.is_airport)
+    if (firmwareOptions.is_airport
+#ifdef USE_ENCRYPTION
+        && encryptionStateSend == ENCRYPTION_STATE_FULL
+#endif
+       )
     {
         OtaUnpackAirportData(otaPktPtr, &((SerialAirPort *)serialIO)->apOutputBuffer);
         return;
@@ -1055,9 +1162,15 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(OTA_Packet_s const * const ot
         return;
     }
 
-    // Must be fully connected to process uplink data, prevents processing data
-    // during sync, where packets can be received before connection
-    if (connectionState == connected)
+    // Before the encrypted session exists, the only DATA TX can emit is the
+    // public session-nonce proposal. Accept it during phase-lock acquisition so crypto
+    // setup does not depend on the ordinary telemetry connection state.
+    if (connectionState == connected
+#ifdef USE_ENCRYPTION
+        || (!InBindingMode && connectionState == tentative
+            && encryptionStateSend != ENCRYPTION_STATE_FULL)
+#endif
+       )
     {
         DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
     }
@@ -1106,6 +1219,18 @@ static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s 
     // but the last 6 bits must modelmatch before sending any data to the FC
     if ((otaSync->UID5 & ~MODELMATCH_MASK) != (UID[5] & ~MODELMATCH_MASK))
         return false;
+
+#ifdef USE_ENCRYPTION
+    if (!InBindingMode && encryptionStateSend == ENCRYPTION_STATE_NONE
+        && !otaSync->cryptoResync)
+    {
+        cryptoControlResponsePending = true;
+    }
+    if (otaSync->cryptoResync)
+    {
+        CryptoResetSlot(otaSync->nonce);
+    }
+#endif
 
     LastSyncPacket = now;
 #if defined(DEBUG_RX_SCOREBOARD)
@@ -1182,31 +1307,75 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     }
     uint32_t const beginProcessing = micros();
 
+    // Keep ELRS phase lock referenced to RF arrival. Crypto recovery work can
+    // exceed the short TOCK slack at fast rates, so scheduling this after
+    // decryption feeds processing latency back into OTA nonce drift.
+    int32_t const slack = std::max(
+        ExpressLRS_currAirRate_Modparams->interval
+            - 2 * ExpressLRS_currAirRate_RFperfParams->TOA,
+        (int32_t)PACKET_TO_TOCK_SLACK);
+    PFDloop.extEvent(beginProcessing + slack);
+
 #ifdef USE_ENCRYPTION
-    if (encryptionStateSend == ENCRYPTION_STATE_FULL)
+    bool encryptedPacketValidated = false;
+    if (!InBindingMode
+        && (encryptionStateSend == ENCRYPTION_STATE_FULL
+            || encryptionStateSend == ENCRYPTION_STATE_PROPOSED))
     {
-        // A recovery SYNC is deliberately plaintext and CRC-checked with the
-        // binding-derived OTA initializer. Validate a copy because OTA4 CRC
-        // validation clears crcHigh in place.
+        // Live discovery and forced recovery SYNC packets are deliberately
+        // plaintext. Proposal retransmissions also remain plaintext until TX
+        // has observed the acknowledgement.
         OTA_Packet_s plaintextPacket = *(OTA_Packet_s *)Radio.RXdataBuffer;
         OTA_Sync_s const * const plaintextSync = OtaIsFullRes ? &plaintextPacket.full.sync.sync : &plaintextPacket.std.sync;
-        if (plaintextPacket.std.type == PACKET_TYPE_SYNC
-            && plaintextSync->cryptoResync
+        bool const plaintextSyncValid = plaintextPacket.std.type == PACKET_TYPE_SYNC
             && plaintextSync->UID4 == UID[4]
             && (plaintextSync->UID5 & ~MODELMATCH_MASK) == (UID[5] & ~MODELMATCH_MASK)
+            && OtaValidatePacketCrc(&plaintextPacket);
+        if (plaintextSyncValid)
+        {
+            if (plaintextSync->cryptoResync
+                && encryptionStateSend == ENCRYPTION_STATE_FULL)
+            {
+                encryptionStateSend = ENCRYPTION_STATE_NONE;
+                cryptoSlotAnchorEstablished = false;
+                lastEncryptedUplinkMs = 0;
+                DataUlReceiver.Unlock();
+                DataUlReceiver.ResetState();
+                DataDlSender.ResetState();
+            }
+        }
+        else if (plaintextPacket.std.type == PACKET_TYPE_DATA
+            && OtaValidatePacketCrc(&plaintextPacket)
+            && encryptionStateSend == ENCRYPTION_STATE_FULL)
+        {
+            // TX may have restarted while RX retained the old session. A
+            // proposal fragment can arrive when the preceding recovery SYNC
+            // was lost, so accept the same plaintext recovery path here.
+            // FULL TX never sends plaintext application DATA.
+            encryptionStateSend = ENCRYPTION_STATE_NONE;
+            cryptoSlotAnchorEstablished = false;
+            lastEncryptedUplinkMs = 0;
+            DataUlReceiver.Unlock();
+            DataUlReceiver.ResetState();
+            DataDlSender.ResetState();
+            cryptoControlResponsePending = true;
+        }
+        else if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED
+            && plaintextPacket.std.type == PACKET_TYPE_DATA
             && OtaValidatePacketCrc(&plaintextPacket))
         {
-            encryptionStateSend = ENCRYPTION_STATE_NONE;
-            DataUlReceiver.ResetState();
-            DataDlSender.ResetState();
+            // Duplicate plaintext proposal packet: process it and repeat the
+            // acknowledgement instead of entering a one-sided session.
+            cryptoControlResponsePending = true;
         }
-        else if (!DecryptMsg(Radio.RXdataBuffer))
+        else if (DecryptMsg(Radio.RXdataBuffer))
         {
-            // The TX will recognize the following plaintext LinkStats as a
-            // nonce-bound recovery signal and initiate a fresh key exchange.
-            encryptionStateSend = ENCRYPTION_STATE_NONE;
-            DataUlReceiver.ResetState();
-            DataDlSender.ResetState();
+            encryptedPacketValidated = true;
+            encryptionStateSend = ENCRYPTION_STATE_FULL;
+            lastEncryptedUplinkMs = millis();
+        }
+        else
+        {
             return false;
         }
     }
@@ -1215,7 +1384,7 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     OTA_Packet_s * const otaPktPtr = (OTA_Packet_s * const)Radio.RXdataBuffer;
     OTA_Packet_s * const otaPktPtrSecond = (OTA_Packet_s * const)Radio.RXdataBufferSecond;
 
-    if (!OtaValidatePacketCrc(otaPktPtr))
+    if (!encryptedPacketValidated && !OtaValidatePacketCrc(otaPktPtr))
     {
         DBGVLN("CRC error");
         #if defined(DEBUG_RX_SCOREBOARD)
@@ -1224,12 +1393,23 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
         return false;
     }
 
-    // The extEvent defines where TOCK timer ISR is to be synced to, i.e. where the packet period begins.
-    // For rates where the TOA is longer than half the packet period schedule the TOCK for rougly 1x TOA before
-    // the TX's end of the period so telemetry is received by the TX in the correct period. For all others,
-    // schedule TOCK to be PACKET_TO_TOCK_SLACK (us) after RX packet reception.
-    int32_t slack = std::max(ExpressLRS_currAirRate_Modparams->interval - 2 * ExpressLRS_currAirRate_RFperfParams->TOA, (int32_t)PACKET_TO_TOCK_SLACK);
-    PFDloop.extEvent(beginProcessing + slack);
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend == ENCRYPTION_STATE_NONE
+        && otaPktPtr->std.type == PACKET_TYPE_RCDATA)
+    {
+        // Before key establishment, only SYNC and the session-nonce
+        // proposal are valid plaintext uplink traffic.
+        return false;
+    }
+
+    if (!InBindingMode && encryptionStateSend == ENCRYPTION_STATE_NONE
+        && otaPktPtr->std.type == PACKET_TYPE_DATA)
+    {
+        // Each fragment of the plaintext session proposal needs a stubborn
+        // acknowledgement. No other pre-session DATA is permitted by TX.
+        cryptoControlResponsePending = true;
+    }
+#endif
 
     doStartTimer = false;
     unsigned long now = millis();
@@ -1242,8 +1422,12 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
 #ifdef USE_ENCRYPTION
         if (encryptionStateSend == ENCRYPTION_STATE_FULL)
         {
-            DecryptMsg( Radio.RXdataBufferSecond );
+            if (!DecryptMsg(Radio.RXdataBufferSecond))
+            {
+                Radio.hasSecondRadioGotData = false;
+            }
         }
+        else
 #endif
         if (!OtaValidatePacketCrc(otaPktPtrSecond))
         {
@@ -1345,7 +1529,15 @@ void ICACHE_RAM_ATTR TXdoneISR()
 void DataUlReceiveComplete()
 {
 #ifdef USE_ENCRYPTION
-	encryption_params_t *encryption_params;
+	session_proposal_t const *session_proposal;
+    if (!InBindingMode
+        && encryptionStateSend != ENCRYPTION_STATE_FULL
+        && DataUlBuffer[0] != MSP_ELRS_INIT_ENCRYPT)
+    {
+        cryptoControlResponsePending = false;
+        DataUlReceiver.Unlock();
+        return;
+    }
 #endif
     switch (DataUlBuffer[0])
     {
@@ -1359,11 +1551,18 @@ void DataUlReceiveComplete()
 
 #ifdef USE_ENCRYPTION
 	case MSP_ELRS_INIT_ENCRYPT:
-        DBGLN("DataUlBuffer = %d, %d, %d, %d, %d, %d", DataUlBuffer[1], DataUlBuffer[2], DataUlBuffer[3], DataUlBuffer[4], DataUlBuffer[5], DataUlBuffer[6]);
-
-	    encryption_params = (encryption_params_t *) &DataUlBuffer[1];
-		CryptoSetKeys(encryption_params);
-		encryptionStateSend = ENCRYPTION_STATE_PROPOSED;
+	    session_proposal = (session_proposal_t const *) &DataUlBuffer[1];
+		if (CryptoSetSession(session_proposal))
+		{
+			encryptionStateSend = ENCRYPTION_STATE_PROPOSED;
+			cryptoSlotAnchorEstablished = false;
+			lastEncryptedUplinkMs = millis();
+		}
+		else
+		{
+			cryptoControlResponsePending = false;
+			DataUlReceiver.ResetState();
+		}
 		break;
 #endif
 
@@ -1821,6 +2020,14 @@ static void ExitBindingMode()
 
     DataUlReceiver.ResetState();
 
+#ifdef USE_ENCRYPTION
+    encryptionStateSend = ENCRYPTION_STATE_NONE;
+    cryptoControlResponsePending = false;
+    cryptoSlotAnchorEstablished = false;
+    lastEncryptedUplinkMs = 0;
+    DataDlSender.ResetState();
+#endif
+
     // Prevent any new packets from coming in
     Radio.SetTxIdleMode();
     // Write the values to eeprom
@@ -2244,8 +2451,33 @@ void loop()
     cycleRfMode(now);
 
     uint32_t localLastValidPacket = LastValidPacket; // Required to prevent race condition due to LastValidPacket getting updated from ISR
-    if ((connectionState == connected) && ((int32_t)ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs < (int32_t)(now - localLastValidPacket))) // check if we lost conn.
+    uint32_t disconnectTimeout = ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs;
+#ifdef USE_ENCRYPTION
+    if (encryptionStateSend != ENCRYPTION_STATE_NONE)
     {
+        disconnectTimeout = CRYPTO_SHORT_LOSS_GRACE_MS;
+        localLastValidPacket = lastEncryptedUplinkMs;
+    }
+#endif
+    if ((connectionState == connected) && ((int32_t)disconnectTimeout < (int32_t)(now - localLastValidPacket))) // check if we lost conn.
+    {
+#ifdef USE_ENCRYPTION
+        if (encryptionStateSend != ENCRYPTION_STATE_NONE)
+        {
+            encryptionStateSend = ENCRYPTION_STATE_NONE;
+            cryptoControlResponsePending = false;
+            cryptoSlotAnchorEstablished = false;
+            lastEncryptedUplinkMs = 0;
+            DataUlReceiver.Unlock();
+            DataUlReceiver.ResetState();
+            DataDlSender.ResetState();
+            // The transition SYNC may have been lost. Dwell on the current
+            // mode first, then scan supported rates and bands for TX.
+            LockRFmode = false;
+            RFmodeLastCycled = now;
+            RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
+        }
+#endif
         LostConnection(true);
     }
 

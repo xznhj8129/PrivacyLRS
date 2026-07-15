@@ -251,40 +251,72 @@ bool ICACHE_RAM_ATTR isDualRadio()
 
 #ifdef USE_ENCRYPTION
 extern ChaCha cipherUplink;
-extern ChaCha cipherDownlink;
-extern uint8_t encryptionCounterUplink[8];
-extern uint8_t encryptionCounterDownlink[8];
+extern ChaCha cipherDownlinkRadio1;
+extern ChaCha cipherDownlinkRadio2;
+extern uint64_t cryptoSlot;
 
-#if defined(TARGET_TX)
-#define ENCRYPT_CIPHER cipherUplink
-#define ENCRYPT_COUNTER encryptionCounterUplink
-#define DECRYPT_CIPHER cipherDownlink
-#define DECRYPT_COUNTER encryptionCounterDownlink
-#else
-#define ENCRYPT_CIPHER cipherDownlink
-#define ENCRYPT_COUNTER encryptionCounterDownlink
-#define DECRYPT_CIPHER cipherUplink
-#define DECRYPT_COUNTER encryptionCounterUplink
-#endif
-
-static const uint8_t EncryptionInitialCounter[] = {109, 110, 111, 112, 113, 114, 115, 116};
 static const uint8_t EncryptionUplinkNonceDomain = 0x55;
-static const uint8_t EncryptionDownlinkNonceDomain = 0xAA;
+static const uint8_t EncryptionDownlinkRadio1NonceDomain = 0xAA;
+static const uint8_t EncryptionDownlinkRadio2NonceDomain = 0xAB;
+static const uint8_t SessionKeyDerivationCounter[8] = {'P', 'L', 'R', 'S', 'K', 'D', 'F', 1};
+static int32_t cryptoReceiveOffsetRadio1;
+static int32_t cryptoReceiveOffsetRadio2;
+static uint8_t cryptoLastResetNonce;
 
-// Helper function to increment 64-bit counter (little-endian)
-static void incrementCounter(uint8_t *counter)
+static bool ICACHE_RAM_ATTR CryptoCounterForSlot(uint8_t *counter, uint64_t slot,
+                                                int32_t offset)
 {
-  for (int i = 0; i < 8; i++)
+  if (offset < 0 && slot < (uint32_t)-offset)
   {
-    counter[i]++;
-    if (counter[i] != 0)
-      break;  // No carry needed
+    return false;
   }
+
+  uint64_t value = offset < 0 ? slot - (uint32_t)-offset : slot + (uint32_t)offset;
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    counter[i] = value;
+    value >>= 8;
+  }
+  return true;
 }
 
-void ICACHE_RAM_ATTR EncryptMsg(uint8_t *output, uint8_t *input)
+static bool ICACHE_RAM_ATTR CryptoCounterForOffset(uint8_t *counter, int32_t offset)
+{
+  return CryptoCounterForSlot(counter, cryptoSlot, offset);
+}
+
+void ICACHE_RAM_ATTR CryptoAdvanceSlot()
+{
+  cryptoSlot++;
+}
+
+void ICACHE_RAM_ATTR CryptoResetSlot(uint64_t slot)
+{
+  cryptoSlot = slot;
+  cryptoReceiveOffsetRadio1 = 0;
+  cryptoReceiveOffsetRadio2 = 0;
+  cryptoLastResetNonce = slot;
+}
+
+uint64_t ICACHE_RAM_ATTR CryptoGetSlot()
+{
+  return cryptoSlot;
+}
+
+uint8_t ICACHE_RAM_ATTR CryptoGetLastResetNonce()
+{
+  return cryptoLastResetNonce;
+}
+
+int32_t ICACHE_RAM_ATTR CryptoGetReceiveOffsetRadio1()
+{
+  return cryptoReceiveOffsetRadio1;
+}
+
+static void ICACHE_RAM_ATTR EncryptMsgWithStream(ChaCha &cipher, uint8_t *output, uint8_t *input)
 {
   size_t packetSize;
+  uint8_t counter[8];
 
   if (OtaIsFullRes)
   {
@@ -295,15 +327,13 @@ void ICACHE_RAM_ATTR EncryptMsg(uint8_t *output, uint8_t *input)
       packetSize = OTA4_PACKET_SIZE;
   }
 
-  // Encrypt with current counter
-  ENCRYPT_CIPHER.encrypt(output, input, packetSize);
-
-  // Explicitly increment counter for next packet
-  incrementCounter(ENCRYPT_COUNTER);
-  ENCRYPT_CIPHER.setCounter(ENCRYPT_COUNTER, 8);
+  CryptoCounterForOffset(counter, 0);
+  cipher.setCounter(counter, sizeof(counter));
+  cipher.encrypt(output, input, packetSize);
 }
 
-bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
+static bool ICACHE_RAM_ATTR DecryptMsgWithStream(ChaCha &cipher, uint8_t *input,
+                                                int32_t &receiveOffset)
 {
   uint8_t decrypted[OTA8_PACKET_SIZE];
   size_t packetSize;
@@ -311,6 +341,7 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
   OTA_Packet_s *otaPktPtr;
   uint8_t oldCrcHigh;
   uint8_t tryCounter[8];
+  int8_t const slotOffsets[] = {0, -1, 1};
 
   if (OtaIsFullRes)
   {
@@ -321,21 +352,18 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
       packetSize = OTA4_PACKET_SIZE;
   }
 
-  // Each RF direction has an independent stream, so a lost downlink cannot
-  // reuse an uplink keystream. Look ahead only for lost packets in this
-  // direction; accepting an older counter would re-accept a replay.
-  uint8_t offsets[] = {0, 1, 2, 3};
+  uint64_t const receiveSlot = cryptoSlot;
 
-  for (int i = 0; i < 4 && !success; i++)
+  // Both ends keep the ELRS packet timer running for the complete short-loss
+  // grace period. The small receive-only window tolerates boundary phasing;
+  // it is not used to search through a dropout.
+  for (int8_t offset : slotOffsets)
   {
-    // Calculate trial counter = expected + offset
-    memcpy(tryCounter, DECRYPT_COUNTER, 8);
-    for (int j = 0; j < offsets[i]; j++)
-      incrementCounter(tryCounter);
+    if (!CryptoCounterForSlot(tryCounter, receiveSlot, receiveOffset + offset))
+      continue;
 
-    // Set cipher to trial counter and decrypt
-    DECRYPT_CIPHER.setCounter(tryCounter, 8);
-    DECRYPT_CIPHER.encrypt(decrypted, input, packetSize);
+    cipher.setCounter(tryCounter, sizeof(tryCounter));
+    cipher.encrypt(decrypted, input, packetSize);
 
     // Validate CRC
     otaPktPtr = (OTA_Packet_s *) decrypted;
@@ -344,7 +372,11 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
       oldCrcHigh = otaPktPtr->std.crcHigh;
     }
 
-    success = OtaValidatePacketCrc(otaPktPtr);
+    // The crypto wall clock and ELRS OTA nonce are independently phased.
+    // Try neighboring ChaCha slots, then validate the plaintext against
+    // ELRS's locally synchronized OTA nonce.
+    success = otaPktPtr->std.type <= PACKET_TYPE_DATA
+        && OtaValidatePacketCrc(otaPktPtr);
 
     if (packetSize == OTA4_PACKET_SIZE)
     {
@@ -353,9 +385,7 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
 
     if (success)
     {
-      // Found correct counter - update expected for next packet
-      memcpy(DECRYPT_COUNTER, tryCounter, 8);
-      incrementCounter(DECRYPT_COUNTER);
+      receiveOffset += offset;
       break;
     }
   }
@@ -363,15 +393,56 @@ bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
   if (success)
   {
     memcpy(input, decrypted, packetSize);
-    DECRYPT_CIPHER.setCounter(DECRYPT_COUNTER, 8);
-  }
-  else
-  {
-    // Failed to decrypt - keep current expected counter
-    DECRYPT_CIPHER.setCounter(DECRYPT_COUNTER, 8);
   }
 
   return(success);
+}
+
+void ICACHE_RAM_ATTR EncryptMsg(uint8_t *output, uint8_t *input)
+{
+#if defined(TARGET_TX)
+  EncryptMsgWithStream(cipherUplink, output, input);
+#else
+  EncryptMsgWithStream(cipherDownlinkRadio1, output, input);
+#endif
+}
+
+bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input)
+{
+#if defined(TARGET_TX)
+  return DecryptMsgWithStream(cipherDownlinkRadio1, input, cryptoReceiveOffsetRadio1);
+#else
+  return DecryptMsgWithStream(cipherUplink, input, cryptoReceiveOffsetRadio1);
+#endif
+}
+
+void ICACHE_RAM_ATTR EncryptMsgForRadio(uint8_t *output, uint8_t *input, bool radio2)
+{
+#if defined(TARGET_TX)
+  EncryptMsgWithStream(cipherUplink, output, input);
+#else
+  if (radio2)
+  {
+    EncryptMsgWithStream(cipherDownlinkRadio2, output, input);
+  }
+  else
+  {
+    EncryptMsgWithStream(cipherDownlinkRadio1, output, input);
+  }
+#endif
+}
+
+bool ICACHE_RAM_ATTR DecryptMsgForRadio(uint8_t *input, bool radio2)
+{
+#if defined(TARGET_TX)
+  if (radio2)
+  {
+    return DecryptMsgWithStream(cipherDownlinkRadio2, input, cryptoReceiveOffsetRadio2);
+  }
+  return DecryptMsgWithStream(cipherDownlinkRadio1, input, cryptoReceiveOffsetRadio1);
+#else
+  return DecryptMsgWithStream(cipherUplink, input, cryptoReceiveOffsetRadio1);
+#endif
 }
 
 static bool InitSessionCipher(ChaCha &cipher, uint8_t const *key, uint8_t const *nonce, uint8_t nonceDomain)
@@ -384,15 +455,29 @@ static bool InitSessionCipher(ChaCha &cipher, uint8_t const *key, uint8_t const 
   cipher.setNumRounds(20);
   if (!cipher.setKey(key, 32)) return false;
   if (!cipher.setIV(directionalNonce, sizeof(directionalNonce))) return false;
-  return cipher.setCounter(EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
+  uint8_t counter[8];
+  CryptoCounterForOffset(counter, 0);
+  return cipher.setCounter(counter, sizeof(counter));
+}
+
+bool DeriveSessionKey(uint8_t const *masterKey, uint8_t const *nonce, uint8_t *sessionKey)
+{
+  ChaCha cipher(20);
+  memset(sessionKey, 0, 32);
+  if (!cipher.setKey(masterKey, 32)) return false;
+  if (!cipher.setIV(nonce, 8)) return false;
+  if (!cipher.setCounter(SessionKeyDerivationCounter, sizeof(SessionKeyDerivationCounter))) return false;
+  cipher.encrypt(sessionKey, sessionKey, 32);
+  return true;
 }
 
 bool InitSessionCiphers(uint8_t const *key, uint8_t const *nonce)
 {
-  memcpy(encryptionCounterUplink, EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
-  memcpy(encryptionCounterDownlink, EncryptionInitialCounter, sizeof(EncryptionInitialCounter));
+  cryptoReceiveOffsetRadio1 = 0;
+  cryptoReceiveOffsetRadio2 = 0;
   if (!InitSessionCipher(cipherUplink, key, nonce, EncryptionUplinkNonceDomain)) return false;
-  return InitSessionCipher(cipherDownlink, key, nonce, EncryptionDownlinkNonceDomain);
+  if (!InitSessionCipher(cipherDownlinkRadio1, key, nonce, EncryptionDownlinkRadio1NonceDomain)) return false;
+  return InitSessionCipher(cipherDownlinkRadio2, key, nonce, EncryptionDownlinkRadio2NonceDomain);
 }
 
 /// in: valid chars are 0-9 + A-F + a-f

@@ -7,6 +7,8 @@
 
 #define stringify_literal(x) # x
 #define stringify_expanded(x) stringify_literal(x)
+#define CRYPTO_SHORT_LOSS_GRACE_MS 10000U
+#define CRYPTO_CONFIG_TRANSITION_SYNC_MS 500U
 
 // DBGLN_KEY() - Secure logging for cryptographic keys
 //
@@ -39,16 +41,22 @@ typedef enum : uint8_t {
 	ENCRYPTION_STATE_DISABLED
 } encryptionState_e;
 
-typedef struct encryption_params_s
+typedef struct session_proposal_s
 {
-    uint8_t nonce[8];
-    uint8_t key[32];  // 256-bit session key (Finding #3)
-
-} encryption_params_t;
+    uint8_t nonce[8];  // Public session nonce; the 256-bit key is derived locally.
+} session_proposal_t;
 
 bool ICACHE_RAM_ATTR DecryptMsg(uint8_t *input);
-void ICACHE_RAM_ATTR EncryptMsg(uint8_t *input, uint8_t *output);
+void ICACHE_RAM_ATTR EncryptMsg(uint8_t *output, uint8_t *input);
+bool ICACHE_RAM_ATTR DecryptMsgForRadio(uint8_t *input, bool radio2);
+void ICACHE_RAM_ATTR EncryptMsgForRadio(uint8_t *output, uint8_t *input, bool radio2);
+bool DeriveSessionKey(uint8_t const *masterKey, uint8_t const *nonce, uint8_t *sessionKey);
 bool InitSessionCiphers(uint8_t const *key, uint8_t const *nonce);
+void ICACHE_RAM_ATTR CryptoAdvanceSlot();
+void ICACHE_RAM_ATTR CryptoResetSlot(uint64_t slot);
+uint64_t ICACHE_RAM_ATTR CryptoGetSlot();
+uint8_t ICACHE_RAM_ATTR CryptoGetLastResetNonce();
+int32_t ICACHE_RAM_ATTR CryptoGetReceiveOffsetRadio1();
 
 /// in: valid chars are 0-9 + A-F + a-f
 /// out_len_max==0: convert until the end of input string, out_len_max>0 only convert this many numbers

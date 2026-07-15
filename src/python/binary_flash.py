@@ -78,15 +78,12 @@ def upload_esp8266_bf(args, options):
 def upload_esp32_uart(args):
     if args.port == None:
         args.port = serials_find.get_serial_port()
-    try:
-        dir = os.path.dirname(args.file.name)
-        cmd = ['--chip', args.platform.replace('-', ''), '--port', args.port, '--baud', str(args.baud), '--after', 'hard_reset', 'write_flash']
-        if args.erase: cmd.append('--erase-all')
-        start_addr = '0x0000' if args.platform.startswith('esp32-') else '0x1000'
-        cmd.extend(['-z', '--flash_mode', 'dio', '--flash_freq', '40m', '--flash_size', 'detect', start_addr, os.path.join(dir, 'bootloader.bin'), '0x8000', os.path.join(dir, 'partitions.bin'), '0xe000', os.path.join(dir, 'boot_app0.bin'), '0x10000', args.file.name])
-        esptool.main(cmd)
-    except:
-        return ElrsUploadResult.ErrorGeneral
+    dir = os.path.dirname(args.file.name)
+    cmd = ['--chip', args.platform.replace('-', ''), '--port', args.port, '--baud', str(args.baud), '--after', 'hard_reset', 'write_flash']
+    if args.erase: cmd.append('--erase-all')
+    start_addr = '0x0000' if args.platform.startswith('esp32-') else '0x1000'
+    cmd.extend(['-z', '--flash_mode', 'dio', '--flash_freq', '40m', '--flash_size', 'detect', start_addr, os.path.join(dir, 'bootloader.bin'), '0x8000', os.path.join(dir, 'partitions.bin'), '0xe000', os.path.join(dir, 'boot_app0.bin'), '0x10000', args.file.name])
+    esptool.main(cmd)
     return ElrsUploadResult.Success
 
 def upload_esp32_etx(args):
