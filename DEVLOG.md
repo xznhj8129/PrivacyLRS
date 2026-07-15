@@ -2,6 +2,9 @@
 
 Timestamps use America/Toronto local time (EDT). This is a working record for the PrivacyLRS 4.0.1 crypto, recovery, and FHSS work.
 
+
+Entries are chronological. Statements such as "uncommitted" or "not tested" describe the state at that timestamp and may be superseded by later entries. The current reviewed checkpoint is summarized at the end.
+
 ## 2026-07-12 23:01 EDT — ELRS 4.0.1 base
 
 - Merged the ELRS 4.0.1 base into `secure_4.0.1`.
@@ -141,3 +144,33 @@ Timestamps use America/Toronto local time (EDT). This is a working record for th
 - Updated the README's exact protocol sequence and source terminology to describe nonce-derived sessions.
 - Removed crypto state manipulation from binding entry itself. Crypto packet transforms and crypto-control scheduling are now bypassed under `InBindingMode`, leaving the stock binding transmitter/receiver timing intact; old session state is cleared at binding exit before normal-mode acquisition.
 - No build, test, flash, or Git-state mutation was performed.
+
+## 2026-07-14 - automated hardware pipeline and checkpoint validation
+
+- Used the external `elrstest` build, flash, configuration, CRSF-handset, receiver-UART, smoke-test, and RF-sweep pipeline with a RadioMaster Nomad X-Band TX and RadioMaster XR1 RX.
+- Added temporary TX status diagnostics for crypto state and reliable proposal transfer. Under `USE_ENCRYPTION`, the ELRS status packet's normal `pktsBad` and `pktsGood` fields currently carry proposal state, package, confirmation polarity, and retry count instead of their stock meanings.
+- Reduced the decrypt candidate set from a broad nine-slot search to the current persistent receive offset plus its immediate neighbors: `0`, `-1`, and `+1`. The XR1 firmware build succeeded after this change. This bounded the per-packet ChaCha20 and CRC cost at high packet rates.
+- The work was committed and pushed as `2ed936e8` (`checkpoint`) on `secure_4.0.1`. The exported Git state showed the branch clean and aligned with `origin/secure_4.0.1`; the only untracked files were the review export artifacts.
+
+## 2026-07-14 - final recorded RF sweep
+
+Configuration: initial 2.4 GHz at 150 Hz, telemetry 1:2, 75-second transition timeout, one-second measurement dwell, bands 2.4 GHz and 915 MHz, and `test_rates = none`.
+
+- Initial 2.4 GHz `150Hz(-112dBm)` session passed after 21.0 seconds. The measurement received 75 valid RC frames in 1.000 seconds with no RC or link dropout events.
+- The 2.4 GHz change from 150 Hz to `250Hz(-108dBm)` passed after 11.6 seconds. The measurement received 125 valid RC frames in 1.001 seconds with no dropout events.
+- The change from 2.4 GHz 250 Hz to 915 MHz `250Hz(-111dBm)` passed after 12.3 seconds. The measurement received 126 valid RC frames in 1.001 seconds with no dropout events.
+- The return from 915 MHz to 2.4 GHz failed to re-establish within 75 seconds. Band selection automatically changed the rate to `K1000(-103dBm)`; TX reported connected but LQ remained zero. The one-second measurement observed 195 valid RC frames against 500 expected and recorded a link dropout.
+- Explicitly selecting `150Hz(-112dBm)` after the failed K1000 transition restored the link in 1.6 seconds. The measurement received 75 valid RC frames in 1.001 seconds with no dropout events.
+- `test_rates = none` skips the explicit per-band rate sweep, but the LR1121 band callback itself changes rate. The final failure is therefore a real combined band/rate transition caused by `TXModuleParameters.cpp` choosing the fastest supported rate in the destination band.
+
+## 2026-07-14 - code and documentation review
+
+- Corrected the README to match the current implementation. Proposal completion uses a 16-marked-SYNC activation barrier, not an acknowledged final-SYNC round trip.
+- Corrected the documented decrypt window. `common.cpp` tries the current persistent receive offset and one adjacent slot on either side, not two slots on either side.
+- Recorded the current hardware pass/fail matrix and stopped describing the checkpoint as unbuilt or untested.
+- Open defect: LR1121 band selection silently chooses the fastest supported destination-band rate. On this Nomad/XR1 pair, the 915 MHz to 2.4 GHz return selected K1000 and failed.
+- Open reliability risk: the same 10-second constant is used for short-loss session retention and the complete TX `PROPOSED` handshake timeout. Observed end-to-end establishment took 11.6 to 21.0 seconds in successful cases, so proposal-phase timing should be instrumented and given a separate timeout before further optimization.
+- Open reliability risk: the 16-SYNC activation barrier is repeated but not acknowledged. TX enters `FULL` after transmitting the barrier even if RX missed every anchor; RX then remains `PROPOSED` until encrypted proof succeeds or its timeout path resets it.
+- Cleanup required before release: remove or build-gate the temporary status-field diagnostics so `pktsBad`, `pktsGood`, and reserved warning bits recover their standard meanings.
+- Security boundary unchanged: packets are encrypted for passive-observer privacy but not authenticated. Valid plaintext recovery control can still be used by an active attacker to disrupt or reset sessions.
+

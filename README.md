@@ -8,6 +8,15 @@ This README documents **PrivacyLRS 1.0**, based on **ExpressLRS 4.0.1**. It is n
 
 PrivacyLRS has no independent release tags or firmware version field yet. The repository inherits ExpressLRS tags, this branch is `secure_4.0.1`, and the firmware identifies itself with the upstream ELRS version. “PrivacyLRS 1.0” is therefore the release identity used by this documentation, not a second version string shown by the firmware.
 
+
+## Current implementation status
+
+This document matches `secure_4.0.1` commit `2ed936e8` (`checkpoint`). The branch and its remote were clean and aligned when this state was reviewed on 2026-07-14.
+
+Hardware validation used a RadioMaster Nomad X-Band TX and RadioMaster XR1 RX with a 1:2 telemetry ratio. The current checkpoint established encrypted RC on 2.4 GHz at 150 Hz, changed to 250 Hz, changed to 915 MHz at 250 Hz, and returned to 150 Hz after a failed K1000 attempt. The direct 915 MHz to 2.4 GHz band return did not restore a usable link within 75 seconds because the band-selection callback automatically selected `K1000(-103dBm)`. Selecting `150Hz(-112dBm)` explicitly restored the link in 1.6 seconds.
+
+This is development firmware. K1000 is not currently validated on this Nomad/XR1 pair, automatic band selection is not a band-only operation, and initial or full re-establishment currently takes seconds rather than being seamless.
+
 ## Purpose and security model
 
 The goal is privacy: someone who records RF traffic but does not know the configured secret should not be able to read RC activity or telemetry. PrivacyLRS preserves ELRS packet sizes, packet rates, latency, radio behavior, and CRSF purpose. It is not intended to be an electronic-attack-resistant control link.
@@ -23,7 +32,7 @@ TX and RX each maintain a separate crypto state. The state is not the same as th
 | State | TX behavior | RX behavior |
 | --- | --- | --- |
 | `NONE` | Sends plaintext marked recovery SYNC packets and may send only the public session-nonce proposal. It sends no RC or application data. | Accepts valid plaintext SYNC and session-nonce proposal fragments. It rejects plaintext RC and application data. |
-| `PROPOSED` | Reliably sends or finishes the nonce proposal, then performs the final slot-anchor exchange. | Has derived and installed the proposed key provisionally, acknowledges proposal/anchor traffic in plaintext, and accepts no application traffic until an encrypted uplink proves the session. |
+| `PROPOSED` | Reliably sends or finishes the nonce proposal, then transmits a 16-SYNC plaintext activation barrier before enabling encrypted traffic. | Has derived and installed the proposed key provisionally, acknowledges proposal fragments in plaintext, follows marked SYNC anchors, and accepts no application traffic until an encrypted uplink proves the session. |
 | `FULL` | Encrypts RC and application uplink packets. Plaintext periodic SYNC remains available for acquisition and recovery. | Decrypts uplink, delivers valid RC/application data, and encrypts normal downlink telemetry. |
 
 The configured binding phrase is hashed in full with SHA-256 to form the 256-bit long-term secret. TX and RX must be built with the same secret. The secret is never sent by ELRS binding. It is used to derive session keys and the private FHSS map.
@@ -40,17 +49,17 @@ No explicit ELRS binding exchange is required when both devices already contain 
 2. Both crypto states start at `NONE`. No plaintext RC, CRSF telemetry, MAVLink, Airport data, or other application data is permitted.
 3. TX sends a plaintext SYNC with `cryptoResync=1`. The SYNC carries the ordinary ELRS acquisition fields: OTA nonce, FHSS index, RF rate, switch mode, telemetry ratio, Gemini mode, OTA protocol, and UID/model-match fields.
 4. Immediately before transmitting that marked SYNC, TX sets the shared crypto slot to the SYNC's eight-bit ELRS OTA nonce. The anchor is counted only if the packet reaches the radio transmit path; an LBT-denied packet is not treated as sent.
-5. RX validates the normal ELRS UID/model-match fields and OTA CRC. It learns the advertised ELRS mode and aligns its OTA nonce, FHSS index, timer, and crypto slot. RX schedules one crypto-control LinkStats return slot.
+5. RX validates the normal ELRS UID/model-match fields and OTA CRC. It learns the advertised ELRS mode and aligns its OTA nonce, FHSS index, timer, and crypto slot. A marked recovery SYNC does not itself require a downlink reply.
 6. TX does not require that first downlink to begin. Once a marked anchor SYNC has actually been transmitted and the reliable uplink sender is free, TX generates a fresh public 64-bit session nonce. Entropy combines radio RSSI noise with the SoC hardware random-number generator.
 7. TX derives the 256-bit session key locally by running ChaCha20 with the long-term secret, the public session nonce, and the dedicated `PLRSKDF1` counter domain. It initializes its provisional traffic streams, places `MSP_ELRS_INIT_ENCRYPT` plus the eight-byte nonce into the existing ELRS reliable uplink-data sender, then enters `PROPOSED`. The complete proposal is nine bytes including the opcode; no session key is transmitted.
 8. TX sends the nonce proposal as ordinary reliable DATA fragments. These fragments are not RC or application data. Between proposal fragments, TX continues sending marked SYNC packets; every received marked SYNC re-anchors RX without discarding proposal fragments already received.
 9. RX accepts proposal fragments while the ELRS connection is tentative or connected. Each fragment opens a crypto-only return slot. RX replies with plaintext LinkStats containing the reliable-transfer acknowledgement and no application telemetry.
 10. When the complete proposal is assembled, RX derives the same session key from its copy of the long-term secret and the received nonce. It initializes its three provisional streams—uplink, radio-1 downlink, and radio-2 downlink—and enters `PROPOSED`. RX does not acknowledge the final fragment until derivation and cipher initialization have completed successfully.
 11. TX retransmits any proposal fragment whose acknowledgement is lost. TX remains `PROPOSED` until the complete reliable payload is acknowledged.
-12. After proposal acknowledgement, TX clears the old anchor result and sends a fresh marked SYNC. RX preserves its provisional key and proposal state, re-anchors its crypto slot to this SYNC, and returns a plaintext crypto-control LinkStats packet.
-13. If either the final anchor or its reply is lost, TX remains `PROPOSED` and repeats the anchor exchange. TX enters `FULL` only after an actually transmitted final anchor receives its associated control reply.
-14. TX sends the first encrypted uplink packet using the newly anchored slot. RX tries the expected slot and the narrow `±2` slot window. A valid decrypted packet changes RX from `PROPOSED` to `FULL`; an RC packet is delivered only after this succeeds.
-15. Once RX is `FULL`, normal downlink LinkStats and application telemetry are encrypted. The handset telemetry indicator may therefore appear briefly during plaintext crypto-control exchange even though encrypted RC has not yet become active.
+12. The final proposal acknowledgement carries the RX's current 16-bit crypto-slot anchor in the first two LinkStats bytes. TX aligns its provisional slot to that value and starts a 16-packet activation barrier.
+13. While the barrier is active, every non-proposal uplink packet is a marked plaintext SYNC. Each actually transmitted SYNC anchors TX to its current eight-bit OTA nonce; each received marked SYNC re-anchors RX while preserving the provisional key. These barrier SYNC packets are repeated for delivery probability and are not individually acknowledged.
+14. After all 16 barrier SYNC packets have been transmitted and the reliable proposal sender is idle, TX enters `FULL` and sends its first encrypted uplink. RX tests its current receive offset and one adjacent slot on either side. A valid decrypted packet changes RX from `PROPOSED` to `FULL`; an RC packet is delivered only after this succeeds.
+15. Once RX is `FULL`, normal downlink LinkStats and application telemetry are encrypted. The handset telemetry indicator may therefore appear briefly during plaintext proposal acknowledgements even though encrypted RC has not yet become active.
 
 #### B. Explicit ELRS binding
 
@@ -90,7 +99,7 @@ RC/uplink and telemetry/downlink use independent ChaCha20 streams. Downlink has 
 
 - Uplink uses the session nonce with one domain value; each physical downlink radio uses a different domain value.
 - The RF-slot number advances from the existing ELRS packet timer every interval, including a lost, skipped, or LBT-denied transmission.
-- A receiver tries the expected slot and at most two slots on either side. It does not move durable counter state based on CRC and never performs an unbounded search.
+- A receiver tries its current persistent receive offset, then one adjacent slot below and above it. A successful adjacent candidate updates the receive offset. It never performs a broad counter search.
 
 This prevents loss in either direction from desynchronizing the other direction or causing a later packet to reuse its ChaCha20 keystream. The OTA CRC remains in the encrypted packet: it detects accidental corruption and identifies a plausible slot in the narrow recovery window, but it is not a cryptographic authenticator.
 
@@ -103,7 +112,7 @@ This prevents loss in either direction from desynchronizing the other direction 
 3. The shared 64-bit crypto slot advances on every ELRS RF timer interval on both devices, including an RF packet loss, a telemetry receive interval, a skipped transmission, or an LBT-denied transmission.
 4. Periodic ELRS SYNC remains plaintext because a receiver that rebooted cannot decrypt a discovery packet. In `FULL`, TX sends it with `cryptoResync=0`; it contains no RC or application payload and opens exactly one crypto-control return slot.
 5. A live `FULL` RX answers that discovery slot with encrypted LinkStats and retains the session. A random plaintext packet outside the immediately associated control window is not accepted by TX as a recovery request.
-6. A missing packet or failed decrypt is dropped without moving durable cipher/slot state. The decryptor tests only the expected slot and `-1`, `+1`, `-2`, and `+2`.
+6. A missing packet or failed decrypt is dropped. The decryptor tests the current persistent receive offset, then `-1` and `+1` relative to that offset. The offset changes only after a packet decrypts and passes the normal OTA type and CRC checks.
 
 #### Downlink-only telemetry loss
 
@@ -117,7 +126,7 @@ This prevents loss in either direction from desynchronizing the other direction 
 1. RX delivers no missing or invalid RC packet. The flight controller sees the normal ELRS loss/failsafe behavior for those intervals.
 2. RX retains its provisional/full session, timer, FHSS position, and crypto slot for up to `CRYPTO_SHORT_LOSS_GRACE_MS`, currently 10,000 ms, measured from the last successfully decrypted uplink.
 3. TX retains its session and continues its timer. If only its downlink is missing, it continues encrypted RC as described above.
-4. When RF returns, RX accepts traffic immediately only if TX and RX are still within the expected `±2` slot window and the decrypted OTA CRC/type are valid. A valid packet refreshes the ten-second timer. There is no large CRC-guided counter search.
+4. When RF returns, RX accepts traffic immediately only if the packet decrypts at the current receive offset or one adjacent slot and the OTA type and CRC are valid. A valid packet refreshes the ten-second timer. There is no large CRC-guided counter search.
 5. If the clocks have moved outside that narrow window, packets remain rejected until full recovery occurs. A plaintext periodic SYNC does not falsely refresh the last-encrypted-uplink timer.
 
 #### RX reboot or ten-second uplink expiry while TX remains running
@@ -141,7 +150,7 @@ This prevents loss in either direction from desynchronizing the other direction 
 2. TX sends the stock ELRS pre-change SYNC spam needed to announce the new settings. The transition barrier prevents an acknowledgement or slot anchor received on the old mode from starting a proposal.
 3. TX commits the configuration and reconfigures the radio. It discards all old-mode anchor results, clears the barrier, and requires a marked SYNC actually transmitted on the new mode.
 4. RX applies a supported advertised rate through the existing ELRS rate-change path. If it misses the transition, it may need to lose the old connection and reacquire by scanning.
-5. Once both radios meet on the new mode, they perform a complete fresh session proposal and final-anchor exchange. There is no key or slot continuity across a deliberate rate/mode change.
+5. Once both radios meet on the new mode, they perform a complete fresh session proposal and 16-SYNC activation barrier. There is no key or slot continuity across a deliberate rate/mode change.
 6. Live cross-band recovery still depends on the underlying ELRS transition/acquisition behavior. PrivacyLRS does not add a parallel old-band/new-band negotiation channel.
 
 At every recovery boundary, the allowed plaintext is limited to ELRS binding packets, acquisition/recovery SYNC, the public session-nonce proposal, and crypto-control LinkStats acknowledgements. The session key is never transmitted. RC and application telemetry remain blocked until both sides prove the new session with encrypted traffic.
@@ -152,6 +161,11 @@ At every recovery boundary, the allowed plaintext is limited to ELRS binding pac
 - Handset briefly receives telemetry but RX delivers no RC: plaintext crypto-control LinkStats may be crossing while one or both sides are still `NONE`/`PROPOSED`; this is not proof that the encrypted session reached `FULL`.
 - Handset reports telemetry lost while RC continues: this can be a downlink-only loss and does not by itself reset the session.
 - Both sides work again after returning to the previous packet rate or band: the encrypted application path is healthy on that mode, but the ELRS mode transition or new-mode session establishment did not complete.
+
+
+### Current transition limitation
+
+On LR1121 TX targets, selecting an RF band currently scans the packet-rate table from its fastest end and applies the first rate supported by that band. A request to return from 915 MHz to 2.4 GHz therefore selected K1000 during the 2026-07-14 Nomad/XR1 sweep. That K1000 link did not remain usable, although explicitly selecting 150 Hz recovered immediately. The callback should preserve a compatible current rate or choose a conservative transition rate instead of silently selecting the fastest mode.
 
 ### Deliberate compromises
 
@@ -174,7 +188,7 @@ The intentional divergence from ExpressLRS 4.0.1 is the crypto layer described a
 - A 256-bit long-term key derived from the configured secret, fresh nonce-derived session keys, and hardware/RSSI nonce entropy.
 - ChaCha20-keyed FHSS permutations with separate primary/dual-band domains and the existing fixed sync-channel structure.
 - Independent uplink and per-radio downlink nonce domains driven by a shared RF-slot clock.
-- Automatic encrypted-session recovery without plaintext RC or application telemetry.
+- Encrypted-session recovery paths that keep RC and application telemetry blocked until the new session becomes active.
 
 Apart from that layer, PrivacyLRS 1.0 deliberately carries ELRS 4.0.1 behavior forward. There are no additional flight features, radio-mode changes, CRSF extensions, or live cross-band-handoff changes in this fork.
 
@@ -182,7 +196,19 @@ Apart from that layer, PrivacyLRS 1.0 deliberately carries ELRS 4.0.1 behavior f
 
 Build and configure TX and RX with the same secret. Their cryptographic hop maps make this build intentionally incompatible with stock ELRS or a PrivacyLRS device built with another secret. Use a carefully configured flight-controller failsafe while testing: a firmware defect or any RF outage can still cause loss of control.
 
-The priority test matrix is recovery after single and burst packet loss, one-sided reset, telemetry-slot loss, packet-rate change, and prolonged outage. Verify that RC and application telemetry remain absent until the encrypted session is active. Earlier native encryption and FHSS suites reached 30 passing tests, but the current nonce-only proposal and recovery changes have not yet been built or run; hardware recovery tests remain essential.
+The priority test matrix remains recovery after single and burst packet loss, one-sided reset, telemetry-slot loss, packet-rate change, band change, and prolonged outage. Verify that RC and application telemetry remain absent until the encrypted session is active. Earlier native encryption and FHSS suites reached 30 passing tests, but the full native suite was not rerun after every change in commit `2ed936e8`.
+
+Hardware sweep results for the current checkpoint on 2026-07-14:
+
+| Test | Result | Re-establishment and measured RC |
+| --- | --- | --- |
+| Initial 2.4 GHz, `150Hz(-112dBm)` | Pass | 21.0 s; 75/75 valid frames in 1.000 s; no measured RC or link dropouts |
+| 2.4 GHz, 150 Hz to `250Hz(-108dBm)` | Pass | 11.6 s; 125/125 valid frames in 1.001 s; no measured RC or link dropouts |
+| 2.4 GHz 250 Hz to 915 MHz `250Hz(-111dBm)` | Pass | 12.3 s; 126/126 valid frames in 1.001 s; no measured RC or link dropouts |
+| 915 MHz 250 Hz to 2.4 GHz automatic selection | Fail | TX selected `K1000(-103dBm)`; no usable link within 75 s; LQ 0; 195 observed RC frames/s against 500 expected |
+| 2.4 GHz K1000 to `150Hz(-112dBm)` | Pass | 1.6 s; 75/75 valid frames in 1.001 s; no measured RC or link dropouts |
+
+The sweep was configured with `test_rates = none`, but changing the LR1121 RF band still changes packet rate because `TXModuleParameters.cpp` selects the first supported rate for the new band, currently the fastest entry. On this target that means K1000 when returning to 2.4 GHz. Treat band transitions as combined band/rate transitions until that callback is corrected.
 
 ## Building and configuring
 
