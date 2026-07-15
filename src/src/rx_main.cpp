@@ -2481,6 +2481,31 @@ void loop()
         LostConnection(true);
     }
 
+#ifdef USE_ENCRYPTION
+    // A provisional session proves itself with the first decrypted uplink
+    // packet. If that proof never arrives (TX reset mid-establishment and is
+    // proposing a fresh session, or the activation barrier was lost), the
+    // stale PROPOSED state blocks every new proposal: cryptoResync resets
+    // apply only to FULL, and the 10s expiry above requires 'connected',
+    // which a tentative receiver never reaches. Expire it on a short
+    // rate-aware window so the next proposal lands on a clean state.
+    if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+    {
+        const uint32_t proposedTimeoutMs = std::max((uint32_t)CRYPTO_RX_PROPOSED_TIMEOUT_MIN_MS,
+            (uint32_t)ExpressLRS_currAirRate_Modparams->interval * CRYPTO_RX_PROPOSED_TIMEOUT_SLOTS / 1000U);
+        if ((uint32_t)(now - lastEncryptedUplinkMs) > proposedTimeoutMs)
+        {
+            encryptionStateSend = ENCRYPTION_STATE_NONE;
+            cryptoControlResponsePending = false;
+            cryptoSlotAnchorEstablished = false;
+            lastEncryptedUplinkMs = 0;
+            DataUlReceiver.Unlock();
+            DataUlReceiver.ResetState();
+            DataDlSender.ResetState();
+        }
+    }
+#endif
+
     if ((connectionState == tentative) && (abs(LPF_OffsetDx.value()) <= 10) && (LPF_Offset.value() < 100) && (LQCalc.getLQRaw() > minLqForChaos())) //detects when we are connected
     {
         GotConnection(now);

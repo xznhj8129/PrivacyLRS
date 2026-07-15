@@ -9,6 +9,21 @@
 #define stringify_expanded(x) stringify_literal(x)
 #define CRYPTO_SHORT_LOSS_GRACE_MS 10000U
 #define CRYPTO_CONFIG_TRANSITION_SYNC_MS 500U
+// TX retry pacing for a stalled session proposal. A healthy establishment
+// (stubborn transfer plus the 16-SYNC activation barrier) completes in well
+// under 160 packet slots, and a full reset re-anchors the slot clock and
+// restarts the transfer, which recovers a wedged first attempt in about one
+// slot-time. The floor keeps fast rates from resetting a handshake that is
+// merely pacing on telemetry slots.
+#define CRYPTO_PROPOSAL_RETRY_SLOTS 160U
+#define CRYPTO_PROPOSAL_RETRY_MIN_MS 2000U
+// RX-side expiry for a provisional (PROPOSED) session that never proved
+// itself with a decrypted uplink packet. Must stay shorter than the TX retry
+// above so a new proposal always lands on a clean receiver state; must stay
+// longer than the TX ack-to-first-encrypted-packet path (the 16-SYNC barrier,
+// roughly 16-40 slots).
+#define CRYPTO_RX_PROPOSED_TIMEOUT_SLOTS 64U
+#define CRYPTO_RX_PROPOSED_TIMEOUT_MIN_MS 1000U
 
 // DBGLN_KEY() - Secure logging for cryptographic keys
 //

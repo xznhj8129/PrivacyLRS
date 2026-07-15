@@ -1979,8 +1979,16 @@ void loop()
       cryptoSessionStartedMs = 0;
     }
   }
+  // Hardware-observed failure mode: the first proposal attempt after a rate or
+  // band change can wedge mid-transfer (the stubborn sender never rewinds to
+  // earlier packages within an attempt), while a full reset plus re-anchor
+  // completes in about a second. Retry quickly and rate-aware instead of
+  // borrowing the 10s RX short-loss grace, which turned every wedge into a
+  // 10-second link outage.
+  const uint32_t proposalRetryMs = std::max((uint32_t)CRYPTO_PROPOSAL_RETRY_MIN_MS,
+      (uint32_t)ExpressLRS_currAirRate_Modparams->interval * CRYPTO_PROPOSAL_RETRY_SLOTS / 1000U);
   if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED
-      && millis() - cryptoSessionStartedMs >= CRYPTO_SHORT_LOSS_GRACE_MS)
+      && millis() - cryptoSessionStartedMs >= proposalRetryMs)
   {
     encryptionStateSend = ENCRYPTION_STATE_NONE;
     cryptoSlotAnchorSent = false;
