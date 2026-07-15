@@ -4,22 +4,22 @@ PrivacyLRS is a privacy-protecting fork of [ExpressLRS (ELRS)](https://www.expre
 
 ## Release identity
 
-This README documents **PrivacyLRS 1.0**, based on **ExpressLRS 4.0.1**. It is not over-the-air compatible with earlier PrivacyLRS builds: reflash both TX and RX together.
+This README documents the current **PrivacyLRS development checkpoint** on branch `secure_4.0.1`, based on **ExpressLRS 4.0.1**. It is not a release: there are no independent release tags, no PrivacyLRS version field in the firmware, and known open defects are listed below. It is not over-the-air compatible with earlier PrivacyLRS builds: reflash both TX and RX together.
 
-PrivacyLRS has no independent release tags or firmware version field yet. The repository inherits ExpressLRS tags, this branch is `secure_4.0.1`, and the firmware identifies itself with the upstream ELRS version. “PrivacyLRS 1.0” is therefore the release identity used by this documentation, not a second version string shown by the firmware.
+The repository inherits ExpressLRS tags and the firmware identifies itself with the upstream ELRS version. A “PrivacyLRS 1.0” identity should only be claimed once a tagged build passes the priority test matrix.
 
 
 ## Current implementation status
 
-This document matches `secure_4.0.1` commit `2ed936e8` (`checkpoint`). The branch and its remote were clean and aligned when this state was reviewed on 2026-07-14.
+This document matches `secure_4.0.1` as of 2026-07-15, which adds three hardware-validated fixes on top of commit `2ed936e8` (`checkpoint`): band changes preserve the current packet rate under encryption instead of selecting the fastest destination rate, the TX proposal retry timeout is fast and rate-aware instead of borrowing the 10-second loss grace, and an RX provisional session that never sees an encrypted packet expires within about a second.
 
-Hardware validation used a RadioMaster Nomad X-Band TX and RadioMaster XR1 RX with a 1:2 telemetry ratio. The current checkpoint established encrypted RC on 2.4 GHz at 150 Hz, changed to 250 Hz, changed to 915 MHz at 250 Hz, and returned to 150 Hz after a failed K1000 attempt. The direct 915 MHz to 2.4 GHz band return did not restore a usable link within 75 seconds because the band-selection callback automatically selected `K1000(-103dBm)`. Selecting `150Hz(-112dBm)` explicitly restored the link in 1.6 seconds.
+Hardware validation used a RadioMaster Nomad X-Band TX and RadioMaster XR1 RX with a 1:2 telemetry ratio. The 2026-07-15 sweep passed every step: initial encrypted RC on 2.4 GHz at 150 Hz in 8.0 s from a cold disconnect, 150 to 250 Hz in 2.6 s, 2.4 GHz to 915 MHz in 4.3 s, 915 MHz back to 2.4 GHz in 1.6 s, and 250 back to 150 Hz in 1.6 s, all with 100 % measured RC delivery and no dropouts.
 
-This is development firmware. K1000 is not currently validated on this Nomad/XR1 pair, automatic band selection is not a band-only operation, and initial or full re-establishment currently takes seconds rather than being seamless.
+This is development firmware. K1000 establishes an encrypted session on this Nomad/XR1 pair but does not sustain full packet delivery (see the test matrix), and full re-establishment takes seconds rather than being seamless.
 
 ## Purpose and security model
 
-The goal is privacy: someone who records RF traffic but does not know the configured secret should not be able to read RC activity or telemetry. PrivacyLRS preserves ELRS packet sizes, packet rates, latency, radio behavior, and CRSF purpose. It is not intended to be an electronic-attack-resistant control link.
+The goal is privacy: someone who records RF traffic but does not know the configured secret should not be able to read RC command contents or telemetry payloads, including GPS position. A passive observer can still see that a link exists: RF activity, transmission timing and cadence, plaintext acquisition SYNCs, and the selected band and rate remain observable. PrivacyLRS preserves ELRS OTA frame sizes, nominal steady-state packet rates, and CRSF purpose; it changes the FHSS sequence, session acquisition and recovery behavior, and re-establishment latency. It is not intended to be an electronic-attack-resistant or low-probability-of-intercept control link.
 
 Use a generated secret or a high-entropy Diceware-style binding phrase. A memorable or predictable phrase permits offline guessing against recorded session setup traffic.
 
@@ -153,7 +153,7 @@ This prevents loss in either direction from desynchronizing the other direction 
 5. Once both radios meet on the new mode, they perform a complete fresh session proposal and 16-SYNC activation barrier. There is no key or slot continuity across a deliberate rate/mode change.
 6. Live cross-band recovery still depends on the underlying ELRS transition/acquisition behavior. PrivacyLRS does not add a parallel old-band/new-band negotiation channel.
 
-At every recovery boundary, the allowed plaintext is limited to ELRS binding packets, acquisition/recovery SYNC, the public session-nonce proposal, and crypto-control LinkStats acknowledgements. The session key is never transmitted. RC and application telemetry remain blocked until both sides prove the new session with encrypted traffic.
+At every recovery boundary, the allowed plaintext is limited to ELRS binding packets, acquisition/recovery SYNC, the public session-nonce proposal, and crypto-control LinkStats acknowledgements. The session key is never transmitted. TX begins encrypted RC and application traffic after the proposal acknowledgement and after transmitting the unacknowledged 16-SYNC activation barrier; RX delivers application traffic only after it successfully decrypts that traffic. A provisional RX session that never receives a decryptable packet expires within about a second and waits for a fresh proposal.
 
 ### Interpreting visible symptoms
 
@@ -163,22 +163,27 @@ At every recovery boundary, the allowed plaintext is limited to ELRS binding pac
 - Both sides work again after returning to the previous packet rate or band: the encrypted application path is healthy on that mode, but the ELRS mode transition or new-mode session establishment did not complete.
 
 
-### Current transition limitation
+### Band-change rate selection
 
-On LR1121 TX targets, selecting an RF band currently scans the packet-rate table from its fastest end and applies the first rate supported by that band. A request to return from 915 MHz to 2.4 GHz therefore selected K1000 during the 2026-07-14 Nomad/XR1 sweep. That K1000 link did not remain usable, although explicitly selecting 150 Hz recovered immediately. The callback should preserve a compatible current rate or choose a conservative transition rate instead of silently selecting the fastest mode.
+Stock ELRS 4.0.1 selects the fastest supported packet rate when the LR1121 RF band changes. Under `USE_ENCRYPTION` this fork instead preserves the current nominal rate when the destination band offers it, and otherwise falls back to a conservative transition rate of at most 250 Hz; non-encrypted builds keep stock behavior. Before this fix, returning from 915 MHz to 2.4 GHz silently selected K1000, which established an encrypted session but could not sustain full packet delivery. High-rate modes such as K1000 remain explicit user selections.
 
 ### Deliberate compromises
 
 - Packets are encrypted but not cryptographically authenticated. CRC is error detection, not a MAC.
 - An active attacker can jam, disrupt, replay, or potentially manipulate traffic. Recovery SYNC is an acquisition signal, not authenticated control.
 - There is no forward secrecy: compromise of the long-term secret can expose recorded session setup and traffic.
-- The fixed ELRS OTA frame has no space for an AEAD tag. Authenticated control would require a new on-air protocol.
+- The fixed ELRS OTA frame has no unused space for a conventional per-packet AEAD tag at the current payload capacity. Authentication is achievable in principle by reducing payload, repurposing fields, or authenticating groups of packets, but any of those changes OTA semantics; this checkpoint deliberately does none of them.
 
 These are intentional boundaries. PrivacyLRS is for passive-observer privacy, not resistance to an active RF adversary.
 
-## Improvements from PrivacyLRS 1.0
+## Changes within this checkpoint
 
-There are none in this initial release. Future releases should list their changes from PrivacyLRS 1.0 in this section.
+On top of the reviewed `2ed936e8` checkpoint (2026-07-15, all hardware-validated):
+
+- Band changes preserve the current packet rate under encryption (stock selected the fastest destination rate, K1000).
+- The TX proposal retry timeout is rate-aware (160 slots, 2 s floor) instead of the 10-second loss grace; a wedged first attempt now costs about 2 s instead of 10 s.
+- An RX provisional session that never decrypts a packet expires after 64 slots (1 s floor), so a fresh proposal always lands on a clean receiver state.
+- The bench status-field diagnostics require an explicit `CRYPTO_BENCH_DIAGNOSTICS` build flag; release builds keep stock `pktsBad`/`pktsGood` meanings.
 
 ## Improvements from ELRS
 
@@ -190,25 +195,27 @@ The intentional divergence from ExpressLRS 4.0.1 is the crypto layer described a
 - Independent uplink and per-radio downlink nonce domains driven by a shared RF-slot clock.
 - Encrypted-session recovery paths that keep RC and application telemetry blocked until the new session becomes active.
 
-Apart from that layer, PrivacyLRS 1.0 deliberately carries ELRS 4.0.1 behavior forward. There are no additional flight features, radio-mode changes, CRSF extensions, or live cross-band-handoff changes in this fork.
+Apart from that layer, PrivacyLRS deliberately carries ELRS 4.0.1 behavior forward. There are no additional flight features, radio-mode changes, CRSF extensions, or live cross-band-handoff changes in this fork.
 
 ## Compatibility and testing
 
 Build and configure TX and RX with the same secret. Their cryptographic hop maps make this build intentionally incompatible with stock ELRS or a PrivacyLRS device built with another secret. Use a carefully configured flight-controller failsafe while testing: a firmware defect or any RF outage can still cause loss of control.
 
-The priority test matrix remains recovery after single and burst packet loss, one-sided reset, telemetry-slot loss, packet-rate change, band change, and prolonged outage. Verify that RC and application telemetry remain absent until the encrypted session is active. Earlier native encryption and FHSS suites reached 30 passing tests, but the full native suite was not rerun after every change in commit `2ed936e8`.
+The priority test matrix remains recovery after single and burst packet loss, one-sided reset, telemetry-slot loss, packet-rate change, band change, and prolonged outage. Verify that RC and application telemetry remain absent until the encrypted session is active. Earlier native encryption and FHSS suites reached 30 passing tests; the 2026-07-15 fixes were validated end-to-end on hardware rather than by rerunning the native suite.
 
-Hardware sweep results for the current checkpoint on 2026-07-14:
+Hardware sweep results (2.4 GHz + 915 MHz, `test_rates = none`, 1:2 telemetry, Nomad/XR1):
 
-| Test | Result | Re-establishment and measured RC |
+| Test | 2026-07-14 checkpoint | 2026-07-15 with fixes |
 | --- | --- | --- |
-| Initial 2.4 GHz, `150Hz(-112dBm)` | Pass | 21.0 s; 75/75 valid frames in 1.000 s; no measured RC or link dropouts |
-| 2.4 GHz, 150 Hz to `250Hz(-108dBm)` | Pass | 11.6 s; 125/125 valid frames in 1.001 s; no measured RC or link dropouts |
-| 2.4 GHz 250 Hz to 915 MHz `250Hz(-111dBm)` | Pass | 12.3 s; 126/126 valid frames in 1.001 s; no measured RC or link dropouts |
-| 915 MHz 250 Hz to 2.4 GHz automatic selection | Fail | TX selected `K1000(-103dBm)`; no usable link within 75 s; LQ 0; 195 observed RC frames/s against 500 expected |
-| 2.4 GHz K1000 to `150Hz(-112dBm)` | Pass | 1.6 s; 75/75 valid frames in 1.001 s; no measured RC or link dropouts |
+| Initial 2.4 GHz, `150Hz(-112dBm)` | Pass, 21.0 s | Pass, 8.0 s (from cold disconnect, includes RX scan cycle) |
+| 2.4 GHz, 150 Hz to `250Hz(-108dBm)` | Pass, 11.6 s | Pass, 2.6 s |
+| 2.4 GHz 250 Hz to 915 MHz `250Hz(-111dBm)` | Pass, 12.3 s | Pass, 4.3 s |
+| 915 MHz 250 Hz to 2.4 GHz | Fail (selected K1000) | Pass, 1.6 s (rate preserved at 250 Hz) |
+| 2.4 GHz 250 Hz to `150Hz(-112dBm)` | Pass, 13.6 s | Pass, 1.6 s |
 
-The sweep was configured with `test_rates = none`, but changing the LR1121 RF band still changes packet rate because `TXModuleParameters.cpp` selects the first supported rate for the new band, currently the fastest entry. On this target that means K1000 when returning to 2.4 GHz. Treat band transitions as combined band/rate transitions until that callback is corrected.
+All 2026-07-15 measurements delivered 100 % of expected RC frames with no RC or link dropout events.
+
+On the 2026-07-14 K1000 failure, the diagnostics showed the RX crypto state reached `FULL` with 195 CRC-valid decrypted RC frames per second against 500 expected and zero RX-UART CRC errors. Session establishment succeeds at K1000; sustained packet delivery does not keep up. The suspected bottleneck is on the test-rig side and is a separate open investigation; with rate preservation, K1000 can no longer be selected implicitly by a band change.
 
 ## Building and configuring
 

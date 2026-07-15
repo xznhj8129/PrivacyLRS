@@ -190,3 +190,26 @@ Configuration: initial 2.4 GHz at 150 Hz, telemetry 1:2, 75-second transition ti
 - With `-DCRYPTO_BENCH_DIAGNOSTICS` the bench behaviour is unchanged: `pktsBad` carries StubbornSender state/expected-confirm/package, `pktsGood` carries the wait count, and the two reserved bits expose PROPOSED/FULL. This is how the `packets_bad=11` values appeared in earlier sweep output.
 - TX build passes with the flag off. No RF/link logic changed; only which values populate the status fields.
 
+## 2026-07-15 - session establishment latency root-caused and fixed
+
+Investigated why establishment took 11.6 to 21.0 seconds. The handshake itself was never slow; the delay was retry pacing around a wedge that a reset always cleared.
+
+Evidence chain from the bench logs (TX status diagnostics plus RX LinkStats):
+
+- The stubborn proposal transfer wedges mid-transfer on the first attempt after a rate or band change: TX sticks at a package waiting for a confirm that never arrives, while RX validates only SYNC packets (LQ pinned near 25 at a 1:2 telemetry ratio). The sender never rewinds to earlier packages within an attempt.
+- The TX `PROPOSED` timeout reused `CRYPTO_SHORT_LOSS_GRACE_MS` (10 s). Every wedge therefore cost exactly one 10-second cycle; the retry after the reset completed in about one second, every time. Observed establishment times decompose as roughly 1.5 to 3.5 s of real work plus zero, one, or two 10-second stalls.
+- A second, RX-side wedge: an RX stuck in `PROPOSED` from an aborted attempt (installed provisional ciphers, never saw the first encrypted packet) is unreachable by any TX-side reset. `cryptoResync` resets deliberately apply only to `FULL` (the activation barrier itself is made of `cryptoResync` SYNCs), and the 10-second session expiry requires `connected`, which a tentative RX that keeps hearing SYNCs never reaches. It recovered only via LQ collapse and the stock disconnect path.
+
+Fixes, both hardware-validated:
+
+- TX: the proposal retry timeout is now its own constant pair (`CRYPTO_PROPOSAL_RETRY_SLOTS` = 160 slots, floor `CRYPTO_PROPOSAL_RETRY_MIN_MS` = 2000 ms), rate-aware so slow rates cannot livelock a legitimately slow handshake. This resolves review finding #2 (the shared 10 s constant); `CRYPTO_SHORT_LOSS_GRACE_MS` now governs only RX short-loss session retention.
+- RX: a `PROPOSED` session that has not proven itself with a decrypted uplink within `CRYPTO_RX_PROPOSED_TIMEOUT_SLOTS` = 64 slots (floor 1000 ms) self-expires to `NONE`, independent of connection state. The window sits above the ack-to-first-encrypted-packet path (16-SYNC barrier) and below the TX retry, so a fresh proposal always lands on a clean receiver.
+
+Final rf-sweep (2.4 GHz + 915 MHz, `test_rates = none`, run by the user on 2026-07-15): all transitions PASS. Initial link 8.0 s (includes RX scan-cycle acquisition from a cold disconnect); 150 to 250 Hz in 2.6 s; 2.4 GHz to 915 MHz in 4.3 s; 915 MHz back to 2.4 GHz in 1.6 s; 250 back to 150 Hz in 1.6 s. All measurements 100 % RC delivery, zero dropouts. Previous checkpoint: 21.1 / 2.6 / 12.3 / 1.6(after manual recovery) / 13.6 s with one hard FAIL.
+
+Residual items:
+
+- The micro-cause of the first-attempt wedge (why RX stops validating proposal DATA packets after a mode change while still validating SYNCs) is mitigated, not root-caused. With both timers in place its worst-case cost is about 2 s; further pursuit needs RX-side diagnostics.
+- K1000 reinterpreted per the 2026-07-14 failure data: `mode=164` showed RX crypto state `FULL`, with 195 CRC-valid decrypted RC frames/s against 500 expected and zero RX-UART CRC errors. Session establishment SUCCEEDS at K1000; sustained packet delivery does not keep up (test-rig side suspected, not the serial adapter). Investigation deferred; the band-change fix keeps K1000 from being selected implicitly.
+- 16-SYNC activation barrier remains unacknowledged (finding #3); with the RX provisional-session expiry the failure mode is now self-healing within about a second, lowering its priority.
+
