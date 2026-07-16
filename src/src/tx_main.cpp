@@ -219,7 +219,7 @@ void RandRSSI(uint8_t *outrnd, size_t len)
 
   uint8_t rnd;
 
-  Radio.RXnb(SX1280_MODE_RX_CONT);
+  Radio.RXnb();
 
   for (int i = 0; i < len; i++)
   {
@@ -242,7 +242,7 @@ void RandRSSI(uint8_t *outrnd, size_t len)
 
   uint8_t rnd;
 
-  Radio.RXnb(LR1121_MODE_RX_CONT);
+  Radio.RXnb();
 
   for (int i = 0; i < len; i++)
   {
