@@ -86,6 +86,13 @@ beyond the port itself, only critical bug fixes are included. It is
   ESP32 LR1121/2400/900 TX targets.
 
 ### Bug fixes
+- **Master key derived from the full binding phrase:** the build script reassigned its
+  working variable to the 6-byte UID string *before* hashing it, so the encryption master
+  key was derived from the 48-bit UID rather than the binding phrase — and ELRS broadcasts
+  most of those UID bytes in SYNC and bind packets, leaving only ~16–32 secret bits. The
+  SHA-256 is now computed from the full binding phrase before the UID substitution. The
+  build log also no longer prints the derived master key or UID, and the build-flags echo
+  redacts `USE_ENCRYPTION`.
 - **ChaCha20 for real:** the previous "ChaCha20 upgrade" set the constructor to 20 rounds
   but `InitCrypto()`/`CryptoSetKeys()` still called `setNumRounds(12)`, silently downgrading
   the link to ChaCha12 at runtime. Now genuinely RFC 8439 ChaCha20. This is the change that

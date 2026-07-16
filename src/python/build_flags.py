@@ -69,15 +69,13 @@ def process_json_flag(define):
 def process_build_flag(define):
     if define.startswith("-D") or define.startswith("!-D"):
         if "MY_BINDING_PHRASE" in define:
+            stronghash = hashlib.sha256(define.encode()).hexdigest()
             bindingPhraseHash = hashlib.md5(define.encode()).digest()
             UIDbytes = ",".join(list(map(str, bindingPhraseHash))[0:6])
             define = "-DMY_UID=" + UIDbytes
-            sys.stdout.write("\u001b[32mUID bytes: " + UIDbytes + "\n")
 
-            stronghash=hashlib.sha256(define.encode()).hexdigest()
+            # The master key covers the complete binding phrase, not its 48-bit UID.
             define = "-DUSE_ENCRYPTION=\"" + stronghash[0:32] + "\""
-            sys.stdout.write("\u001b[32mUSE_ENCRYPTION: " + stronghash[0:32] + "\n")
-            sys.stdout.flush()
         if "HOME_WIFI_SSID=" in define:
             parts = re.search(r"(.*)=\w*\"(.*)\"$", define)
             if parts and parts.group(2):
@@ -202,7 +200,8 @@ if env.get('PIOPLATFORM', '') == 'espressif8266':
 
 env['OPTIONS_JSON'] = json_flags
 env['BUILD_FLAGS'] = build_flags
-sys.stdout.write("\nbuild flags: %s\n\n" % build_flags)
+display_flags = ["-DUSE_ENCRYPTION=\"[redacted]\"" if "USE_ENCRYPTION" in flag else flag for flag in build_flags]
+sys.stdout.write("\nbuild flags: %s\n\n" % display_flags)
 
 if fnmatch.filter(build_flags, '*PLATFORM_ESP32*'):
     sys.stdout.write("\u001b[32mBuilding for ESP32 Platform\n")
