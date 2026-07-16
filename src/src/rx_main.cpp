@@ -71,6 +71,7 @@ static bool cryptoControlResponsePending;
 static bool cryptoSlotAnchorEstablished;
 static volatile uint32_t lastEncryptedUplinkMs;
 #endif
+#include "CryptoTrace.h"
 //
 // Code encapsulated by the ARDUINO_CORE_INVERT_FIX #ifdef temporarily fixes EpressLRS issue #2609 which is caused
 // by the Arduino core (see https://github.com/espressif/arduino-esp32/issues/9896) and fixed
@@ -306,8 +307,10 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
     linkStats.uplink_SNR = SNR_DESCALE(Radio.LastPacketSNRRaw); // possibly overriden below
     //linkStats.uplink_Link_quality = uplinkLQ; // handled in Tick
     linkStats.rf_Mode = ExpressLRS_currAirRate_Modparams->enum_rate;
-#ifdef USE_ENCRYPTION
-    // Temporary bench diagnostics in the otherwise unused high bits.
+#if defined(USE_ENCRYPTION) && defined(CRYPTO_BENCH_DIAGNOSTICS)
+    // Bench diagnostics (opt-in via -DCRYPTO_BENCH_DIAGNOSTICS): crypto state
+    // in the rf_Mode high bits, slot/nonce/offset in the remaining fields.
+    // These overwrite the real link statistics; never enable for flight.
     if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
     {
         linkStats.rf_Mode |= 0x40;
@@ -666,6 +669,15 @@ bool ICACHE_RAM_ATTR HandleSendDataDl()
       {
         CryptoResetSlot(OtaNonce);
         cryptoSlotAnchorEstablished = true;
+        CTRACE(FINAL_ACK_SENT, (uint16_t)CryptoGetSlot());
+      }
+      else if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+      {
+        CTRACE_ACK_RETX();
+      }
+      else
+      {
+        CTRACE_CTRL_ACK();
       }
       uint16_t const anchor = CryptoGetSlot();
       OTA_LinkStats_s * const stats = OtaIsFullRes
@@ -993,6 +1005,7 @@ void LostConnection(bool resumeRx)
     DBGLN("lost conn fc=%d fo=%d", FreqCorrection, hwTimer::getFreqOffset());
 
     setConnectionState(disconnected); //set lost connection
+    CTRACE(DISCONNECTED);
     RXtimerState = tim_disconnected;
     hwTimer::resetFreqOffset();
     PfdPrevRawOffset = 0;
@@ -1027,6 +1040,7 @@ void ICACHE_RAM_ATTR TentativeConnection(unsigned long now)
 {
     PFDloop.reset();
     setConnectionState(tentative);
+    CTRACE(TENTATIVE);
     connectionHasModelMatch = false;
     RXtimerState = tim_disconnected;
     DBGLN("tentative conn");
@@ -1057,6 +1071,7 @@ void GotConnection(unsigned long now)
     LockRFmode = firmwareOptions.lock_on_first_connection;
 
     setConnectionState(connected); //we got a packet, therefore no lost connection
+    CTRACE(CONNECTED);
     RXtimerState = tim_tentative;
     GotConnectionMillis = now;
     webserverPreventAutoStart = true;
@@ -1083,6 +1098,7 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPkt
     // No channels packets to the FC or PWM pins if no model match
     if (connectionHasModelMatch)
     {
+        CTRACE_ONCE(FIRST_RC_DELIVERED);
         if (ExpressLRS_currAirRate_Modparams->numOfSends == 1)
         {
             crsfRCFrameAvailable();
@@ -1172,6 +1188,12 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(OTA_Packet_s const * const ot
 #endif
        )
     {
+#ifdef USE_ENCRYPTION
+        if (!InBindingMode && encryptionStateSend != ENCRYPTION_STATE_FULL)
+        {
+            CTRACE_FRAG_RECV(packageIndex);
+        }
+#endif
         DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
     }
 }
@@ -1221,6 +1243,7 @@ static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s 
         return false;
 
 #ifdef USE_ENCRYPTION
+    CTRACE_ONCE(FIRST_VALID_SYNC, otaSync->nonce);
     if (!InBindingMode && encryptionStateSend == ENCRYPTION_STATE_NONE
         && !otaSync->cryptoResync)
     {
@@ -1228,6 +1251,11 @@ static bool ICACHE_RAM_ATTR ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s 
     }
     if (otaSync->cryptoResync)
     {
+        CTRACE_ONCE(MARKED_SYNC_RECEIVED, otaSync->nonce);
+        if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+        {
+            CTRACE_ACT_SYNC_RECV();
+        }
         CryptoResetSlot(otaSync->nonce);
     }
 #endif
@@ -1336,6 +1364,7 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
             if (plaintextSync->cryptoResync
                 && encryptionStateSend == ENCRYPTION_STATE_FULL)
             {
+                CTRACE_RESET(FORCED_RECOVERY_SYNC);
                 encryptionStateSend = ENCRYPTION_STATE_NONE;
                 cryptoSlotAnchorEstablished = false;
                 lastEncryptedUplinkMs = 0;
@@ -1352,6 +1381,7 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
             // proposal fragment can arrive when the preceding recovery SYNC
             // was lost, so accept the same plaintext recovery path here.
             // FULL TX never sends plaintext application DATA.
+            CTRACE_RESET(PLAINTEXT_RECOVERY_PACKET);
             encryptionStateSend = ENCRYPTION_STATE_NONE;
             cryptoSlotAnchorEstablished = false;
             lastEncryptedUplinkMs = 0;
@@ -1366,17 +1396,28 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
         {
             // Duplicate plaintext proposal packet: process it and repeat the
             // acknowledgement instead of entering a one-sided session.
+            CTRACE_ONCE(DUP_PROPOSAL_RECEIVED);
             cryptoControlResponsePending = true;
-        }
-        else if (DecryptMsg(Radio.RXdataBuffer))
-        {
-            encryptedPacketValidated = true;
-            encryptionStateSend = ENCRYPTION_STATE_FULL;
-            lastEncryptedUplinkMs = millis();
         }
         else
         {
-            return false;
+            if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+            {
+                CTRACE_ONCE(FIRST_DECRYPT_ATTEMPT);
+            }
+            if (!DecryptMsg(Radio.RXdataBuffer))
+            {
+                return false;
+            }
+            encryptedPacketValidated = true;
+            if (encryptionStateSend == ENCRYPTION_STATE_PROPOSED)
+            {
+                CTRACE(INITIAL_DECRYPT_OFFSET,
+                    (uint16_t)(int16_t)CryptoGetReceiveOffsetRadio1());
+                CTRACE(ENTERED_FULL, (uint16_t)CryptoGetSlot());
+            }
+            encryptionStateSend = ENCRYPTION_STATE_FULL;
+            lastEncryptedUplinkMs = millis();
         }
     }
 #endif
@@ -1552,16 +1593,20 @@ void DataUlReceiveComplete()
 #ifdef USE_ENCRYPTION
 	case MSP_ELRS_INIT_ENCRYPT:
 	    session_proposal = (session_proposal_t const *) &DataUlBuffer[1];
+		CTRACE(PROPOSAL_COMPLETE,
+			((uint16_t)session_proposal->nonce[0] << 8) | session_proposal->nonce[1]);
 		if (CryptoSetSession(session_proposal))
 		{
 			encryptionStateSend = ENCRYPTION_STATE_PROPOSED;
 			cryptoSlotAnchorEstablished = false;
 			lastEncryptedUplinkMs = millis();
+			CTRACE(SESSION_KEY_INSTALLED);
 		}
 		else
 		{
 			cryptoControlResponsePending = false;
 			DataUlReceiver.ResetState();
+			CTRACE_RESET(INIT_FAILED);
 		}
 		break;
 #endif
@@ -2021,6 +2066,7 @@ static void ExitBindingMode()
     DataUlReceiver.ResetState();
 
 #ifdef USE_ENCRYPTION
+    CTRACE_RESET(BINDING);
     encryptionStateSend = ENCRYPTION_STATE_NONE;
     cryptoControlResponsePending = false;
     cryptoSlotAnchorEstablished = false;
@@ -2361,6 +2407,7 @@ void setup()
         }
         crsfRouter.addEndpoint(&crsfReceiver);
         crsfRouter.addConnector(&otaConnector);
+        CTRACE_INIT(&otaConnector);
         setupSerial();
         setupSerial1();
 
@@ -2408,6 +2455,8 @@ void loop()
     }
 
     devicesUpdate(now);
+
+    CTRACE_FLUSH();
 
     // read and process any data from serial ports, send any queued non-RC data
     handleSerialIO();
@@ -2464,6 +2513,7 @@ void loop()
 #ifdef USE_ENCRYPTION
         if (encryptionStateSend != ENCRYPTION_STATE_NONE)
         {
+            CTRACE_RESET(CONNECTION_STATE_CHANGE);
             encryptionStateSend = ENCRYPTION_STATE_NONE;
             cryptoControlResponsePending = false;
             cryptoSlotAnchorEstablished = false;
@@ -2495,6 +2545,7 @@ void loop()
             (uint32_t)ExpressLRS_currAirRate_Modparams->interval * CRYPTO_RX_PROPOSED_TIMEOUT_SLOTS / 1000U);
         if ((uint32_t)(now - lastEncryptedUplinkMs) > proposedTimeoutMs)
         {
+            CTRACE_RESET(STALE_PROPOSED_TIMEOUT);
             encryptionStateSend = ENCRYPTION_STATE_NONE;
             cryptoControlResponsePending = false;
             cryptoSlotAnchorEstablished = false;
